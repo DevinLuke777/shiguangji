@@ -103,6 +103,25 @@ def queue_clear_all():
     save_queue([])
     return redirect(url_for("queue_status"))
 
+
+# ─── 失败条目重新排队 ──────────────────────────────────
+@app.route("/queue-retry", methods=["POST"])
+def queue_retry():
+    """把失败条目改回 pending，哨兵几秒内会自动重新处理"""
+    qid = request.form.get("id", type=int)
+    if qid is not None:
+        q = load_queue()
+        changed = False
+        for it in q:
+            if it.get("id") == qid and it.get("status") == "failed":
+                it["status"] = "pending"
+                it["message"] = "手动重试中"
+                it["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                changed = True
+        if changed:
+            save_queue(q)
+    return redirect(url_for("queue_status"))
+
 @app.route("/queue")
 def queue_status():
     q = load_queue()
@@ -139,7 +158,12 @@ def queue_status():
         else:
             disp = it["url"][:70]
         msg = f"<br><span style='font-size:12px;color:{color}'>{it.get('message','')}</span>" if it.get("message") else ""
-        html += f"<tr><td>{plat}</td><td style='color:{color};text-align:center'>{emoji} {status}</td><td>{disp}{msg}</td></tr>"
+        retry = ""
+        if status == "failed":
+            retry = (f"<form method='post' action='/queue-retry' style='display:inline'>"
+                     f"<input type='hidden' name='id' value='{it['id']}'>"
+                     f"<button class='btn' style='background:var(--accent);padding:3px 10px;font-size:12px;margin-left:6px'>🔄 重试</button></form>")
+        html += f"<tr><td>{plat}</td><td style='color:{color};text-align:center'>{emoji} {status}</td><td>{disp}{msg}{retry}</td></tr>"
     html += """</table></div>
 <nav class="tabbar">
   <a href="/" class="titem"><span class="tic">🏠</span>浏览</a>
