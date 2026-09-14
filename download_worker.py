@@ -44,6 +44,7 @@ def save_queue(q):
 
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走代理
+WARN = []  # 本次下载的警告(如水印兜底)，由 process_one 写进队列消息
 
 
 def fetch(url, timeout=20, referer=None):
@@ -319,6 +320,8 @@ def xhs_download_video(html, nid, title, author, real_url=""):
         if xhs_downloader_video(nid, real_url, title, d):
             gen_thumb(d, title, is_video=True)
             return os.path.join("小红书", today(), title)
+    if tag == "259":
+        WARN.append("平台只提供 259 水印流(无 309/258)，已入库但可能带水印，可在 App 重新分享后重试")
     data = fetch(vurl, timeout=120, referer="https://www.xiaohongshu.com/")
     with open(os.path.join(d, f"{title}.mp4"), "wb") as f:
         f.write(data)
@@ -460,7 +463,11 @@ def process_one(item):
         item["status"] = "done"
         item["title"] = title
         item["path"] = rel
-        item["message"] = "完成"
+        if WARN:
+            item["message"] = "⚠️ " + "; ".join(WARN)
+            WARN.clear()
+        else:
+            item["message"] = "完成"
     except Exception as e:
         item["status"] = "failed"
         item["message"] = str(e)[:150]
@@ -476,6 +483,16 @@ def drain():
     for it in q:
         st = it.get("status")
         if st == "done":
+            if str(it.get("message", "")).startswith("⚠️"):
+                # 成功但带警告(如水印兜底)：保留 1 天让用户在队列页看到
+                try:
+                    ct = datetime.strptime(it.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
+                    if now_ts - ct.timestamp() > 86400:
+                        continue
+                except Exception:
+                    pass
+                kept.append(it)
+                continue
             continue  # 成功直接删
         if st == "failed":
             # 超过1天自动清（86400s），保留原因供短期查看

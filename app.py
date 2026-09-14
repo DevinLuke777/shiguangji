@@ -6,7 +6,7 @@ media-vault Web 展示应用 v4 — 全部重写
 """
 import os, re, sqlite3, json, time
 from datetime import datetime
-from flask import Flask, render_template_string, request, abort, url_for, Response, redirect
+from flask import Flask, render_template_string, request, abort, url_for, Response, redirect, jsonify
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE, "media_library.db"))
@@ -89,6 +89,42 @@ def add_link():
     if added:
         save_queue(q)
     return redirect(url_for("index", msg="added" if added else "dup"))
+
+
+# ─── 给 iOS 快捷指令 / 自动化用的极简接口 ──────────────
+@app.route("/api/add", methods=["GET", "POST"])
+def api_add():
+    """任意文本里抓 http(s) 链接丢进队列，返回 JSON。
+    用法: GET /api/add?url=<分享文本或链接>  或 POST form url=... / links=...
+    兼容分享口令（如「8.88 复制打开抖音… https://v.douyin.com/xxx/」）。"""
+    raw = " ".join(x for x in (request.values.get("url"), request.values.get("links"),
+                               request.values.get("text")) if x)
+    if not raw:
+        raw = request.get_data(as_text=True)[:4000]
+    links, seen_links = [], set()
+    for cand in re.findall(r"https?://[^\s\u4e00-\u9fff,，、；;：:）)】\]]+", raw):
+        cand = cand.rstrip(".,;:!?，。；：！？")
+        if cand and cand not in seen_links:
+            seen_links.add(cand)
+            links.append(cand)
+    if not links:
+        return jsonify({"ok": False, "added": 0, "msg": "没找到链接"})
+    q = load_queue()
+    added, dup = [], []
+    for link in links:
+        if any(it.get("url") == link for it in q):
+            dup.append(link)
+            continue
+        q.append({"id": int(time.time() * 1000) % 1000000,
+                  "url": link, "status": "pending",
+                  "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "message": ""})
+        added.append(link)
+    if added:
+        save_queue(q)
+    msg = f"已加入队列 {len(added)} 条" if added else "已在队列中(跳过)"
+    if dup and added:
+        msg += f"，{len(dup)} 条重复"
+    return jsonify({"ok": True, "added": len(added), "dup": len(dup), "msg": msg})
 
 @app.route("/queue-clear-failed", methods=["POST"])
 def queue_clear_failed():
