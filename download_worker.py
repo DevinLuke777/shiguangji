@@ -15,7 +15,7 @@ from datetime import datetime
 MEDIA = "/vol1/1000/Downloads/拾光集"
 QUEUE = os.environ.get("QUEUE_FILE", os.path.join(MEDIA, "_queue.json"))
 LOCK = os.path.join(MEDIA, "_queue.lock")
-VALT = "/vol1/1000/Docker/media-vault"  # ingest.py 所在(运行实例)
+VALT = "/vol1/1000/Docker/shiguangji"  # ingest.py 所在(运行实例)
 INGEST = os.path.join(VALT, "ingest.py")
 # 路径迁移：原飞牛 Hermes 已弃用，改用本地 Hermes venv
 PY = "/home/16675244747/.hermes/hermes-agent/venv/bin/python3"
@@ -524,9 +524,19 @@ def ingest(rel, title, url, platform, author=None, avatar=None):
     out = (r.stdout or b"").decode("utf-8", "ignore")
     err = (r.stderr or b"").decode("utf-8", "ignore")
     # 去重拦截或被跳过：下载的文件不会入库 → 清掉已下载目录防残留
+    # ⚠ 安全阀：若该目录已被库里某条目引用（轻解析会复用同名目录覆盖下载），绝不能删，
+    #   否则会把已收藏条目的媒体一起删掉（出现「有记录无文件」）
     if "已收藏过" in out or "跳过" in out:
         d = os.path.join(MEDIA, rel)
-        if os.path.isdir(d):
+        referenced = False
+        try:
+            import sqlite3 as _sq
+            _c = _sq.connect(os.path.join(VALT, "media_library.db"))
+            referenced = bool(_c.execute("SELECT 1 FROM items WHERE local_path=?", (rel,)).fetchone())
+            _c.close()
+        except Exception:
+            referenced = True  # 查不到就保守当作已引用，宁可不删
+        if os.path.isdir(d) and not referenced:
             shutil.rmtree(d, ignore_errors=True)
         return False
     if r.returncode != 0:
