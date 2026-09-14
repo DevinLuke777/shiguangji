@@ -12,13 +12,14 @@
 import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.parse, shutil, glob
 from datetime import datetime
 
-MEDIA = os.environ.get("MEDIA_ROOT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "拾光集"))
+MEDIA = "/vol1/1000/Downloads/拾光集"
 QUEUE = os.environ.get("QUEUE_FILE", os.path.join(MEDIA, "_queue.json"))
 LOCK = os.path.join(MEDIA, "_queue.lock")
-VALT = os.environ.get("MEDIA_VAULT_DIR", "/vol1/1000/Docker/media-vault")  # ingest.py 所在(运行实例)
+VALT = "/vol1/1000/Docker/media-vault"  # ingest.py 所在(运行实例)
 INGEST = os.path.join(VALT, "ingest.py")
-PY = os.environ.get("PYTHON_BIN", os.environ.get("PYTHON", "python3"))
-XHS_VENV = os.environ.get("XHS_VENV", "python3")    # XHS-Downloader 的 venv python
+# 路径迁移：原飞牛 Hermes 已弃用，改用本地 Hermes venv
+PY = "/home/16675244747/.hermes/hermes-agent/venv/bin/python3"
+XHS_VENV = "/home/16675244747/.hermes/workspace/xhs-downloader/.venv/bin/python"   # XHS-Downloader 独立 venv（cookie 后续补）
 
 UA_I = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 UA_D = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -52,7 +53,7 @@ def fetch(url, timeout=20, referer=None):
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    # 直连：本机服务(localhost:8086 轻解析)若走 http_proxy 会被代理劫持报 502 Bad Gateway
+    # 直连：本机服务(localhost:8086 轻解析)若走 http_proxy 会被 sing-box 劫持报 502 Bad Gateway
     return _OPENER.open(req, timeout=timeout).read()
 
 
@@ -60,6 +61,13 @@ def clean_title(t):
     t = (t or "").strip()
     while t and not re.match(r"[\u4e00-\u9fffA-Za-z0-9]", t[0]):
         t = t[1:]
+    # 去换行符（0x0a/0x0d -> 空格），否则目录名带换行 Flask URL 404
+    t = re.sub(r'[\n\r]+', ' ', t).strip()
+    # 去掉末尾 #话题标签（小红书常见）
+    t = re.sub(r'(\s*#\S+\s*)+$', '', t).strip()
+    # 截断过长标题（目录名限制）
+    if len(t) > 80:
+        t = t[:80].rstrip()
     return t
 
 
@@ -239,14 +247,12 @@ def xhs_expand(url):
 def xhs_get_page(real_url, nid, tok):
     """抓页面。实测(2026-08-18): 带 cookie 反而触发反爬返回 ~10KB JS 壳，
     不带 cookie + token + 桌面UA 成功(861KB 含 masterUrl)。token 失效时返回空壳→抛错。
-    2026-09-14 补：先不带 cookie 试，失败再带 cookie（cookie 通道可救部分页面）。"""
+    2026-09-14 补：先不带 cookie 试，失败再带 cookie（cookie 通道可救部分 token 过期页）。"""
     url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
     if tok:
         url += f"?xsec_source=app_share&xsec_token={tok}="
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "xhs_cookie.txt")
-    cookie = ""
-    if os.path.isfile(cookie_file):
-        cookie = open(cookie_file, encoding="utf-8").read().strip()
+    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
+    cookie = open(cookie_file, encoding="utf-8").read().strip() if os.path.isfile(cookie_file) else ""
     passes = [(UA_D, ""), (UA_I, "")]
     if cookie:
         passes += [(UA_I, cookie), (UA_D, cookie)]
@@ -266,8 +272,8 @@ def xhs_get_page(real_url, nid, tok):
 
 def xhs_pick_stream(html):
     """挑无水印流：优先 309(X265) → 258(X264) → 兜底第一个 masterUrl(通常 259 带水印)。
-    小红书页面里 259 流(MINI_APP_259)带作者头像+小红书 logo 水印，309/258 是干净原流。
-    实测判据：本地文件字节数 == 259 流 Content-Length 即为水印版。"""
+    返回 (url, tag)。259 流带作者头像+小红书 logo 水印，309/258 是干净原流(2026-09-14 实锤：
+    本地字节数 == 页面 259 流 Content-Length 完全一致)。"""
     for tag in ("309", "258"):
         m = re.search(r'"masterUrl":"([^"]+_%s\.mp4[^"]*)"' % tag, html)
         if m:
@@ -279,8 +285,9 @@ def xhs_pick_stream(html):
 
 
 def xhs_downloader_video(nid, real_url, title, d):
-    """用 XHS-Downloader 下视频(走官方签名接口，稳定拿 309 无水印流)。成功返回 True。"""
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "xhs_cookie.txt")
+    """用 XHS-Downloader 下视频(它走官方签名接口，稳定拿 309 无水印流)。
+    成功返回 True。"""
+    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
     if not (os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV)):
         return False
     tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
@@ -290,7 +297,7 @@ def xhs_downloader_video(nid, real_url, title, d):
     work = f"/tmp/xhs_vid_{nid}"
     shutil.rmtree(work, ignore_errors=True)
     try:
-        xhs_dir = os.environ.get("XHS_DIR", "xhs-downloader")
+        xhs_dir = os.environ.get("XHS_DIR", "/home/16675244747/.hermes/workspace/xhs-downloader")
         cookie = open(cookie_file, encoding="utf-8").read().strip()
         subprocess.run([XHS_VENV, os.path.join(xhs_dir, "main.py"), "--url", url,
                         "--cookie", cookie, "--work_path", work, "--download_record", "false"],
@@ -309,7 +316,7 @@ def xhs_downloader_video(nid, real_url, title, d):
 
 
 def xhs_download_video(html, nid, title, author, real_url=""):
-    """挖无水印流(309/258)下载视频；页面只有 259 水印流时改走 XHS-Downloader。"""
+    """挖无水印流(309/258)下载视频；页面只有 259 时改走 XHS-Downloader。"""
     vurl, tag = xhs_pick_stream(html)
     if not vurl:
         raise RuntimeError("无 masterUrl")
@@ -334,7 +341,7 @@ def xhs_download_images(html, nid, title, author, real_url):
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
     # 尝试 XHS-Downloader(无水印原图)
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/vol1/@appdata/trim.hermes/workspace/xhs_cookie.txt")
+    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
     if os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV):
         tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
         url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
@@ -344,20 +351,21 @@ def xhs_download_images(html, nid, title, author, real_url):
         work = f"/tmp/xhs_worker_{nid}"
         shutil.rmtree(work, ignore_errors=True)
         try:
-            xhs_dir = os.environ.get("XHS_DIR", "/vol1/@appdata/trim.hermes/workspace/xhs-downloader")
+            xhs_dir = os.environ.get("XHS_DIR", "/home/16675244747/.hermes/workspace/xhs-downloader")
             subprocess.run(
                 [XHS_VENV, os.path.join(xhs_dir, "main.py"),
                  "--url", url, "--cookie", cookie, "--work_path", work,
                  "--image_format", "PNG", "--download_record", "false"],
                 capture_output=True, timeout=150)
             pngs = glob.glob(os.path.join(work, "Download", "**", "*.png"), recursive=True)
-            # 递归 glob 已含根目录，按 basename 去重（否则每张图会被复制两份）
-            seen, uniq = set(), []
+            # 递归 glob 已覆盖根目录，额外去重（同一文件被两条 glob 命中会导致每张图存两份）
+            seen = set()
+            uniq = []
             for x in pngs:
-                k = os.path.basename(x)
-                if k in seen:
+                key = os.path.basename(x)
+                if key in seen:
                     continue
-                seen.add(k)
+                seen.add(key)
                 uniq.append(x)
             pngs = sorted(uniq)
             if pngs:
@@ -418,28 +426,111 @@ def download_xiaohongshu(url):
     ma = re.search(r'"nickname":"([^"]*)"', html)
     if ma:
         author = ma.group(1)
+    # 提取头像（解码 \u002F 转义）
+    avatar = None
+    av_m = re.search(r'"avatar":"([^"]+)"', html)
+    if av_m:
+        avatar = av_m.group(1).replace("\\u002F", "/").replace("\u002F", "/")
     has_video = bool(re.search(r'"masterUrl":"[^"]+_(259|309|258)\.mp4', html))
     if typ == "video" or has_video or ('"masterUrl"' in html and '"imageList"' not in html):
         rel = xhs_download_video(html, nid, title, author, real_url=real)
-        return rel, title, "小红书"
+        return rel, title, "小红书", avatar
     else:
         rel = xhs_download_images(html, nid, title, author, real)
-        return rel, title, "小红书"
+        return rel, title, "小红书", avatar
 
 
 # ── 主流程 ─────────────────────────────────────────────
-def ingest(rel, title, url, platform, author=None):
-    r = subprocess.run([PY, INGEST, "--platform", platform, "--url", url,
-                        "--path", rel, "--title", title,
-                        *(["--author", author] if author and author != "未知作者" else [])],
-                       capture_output=True, timeout=60)
+
+# ── X / Twitter (2026-09-09) ──────────────────────────────
+def download_x(url):
+    """X/Twitter 链接: fxtwitter API 解析 → 桌面 UA + 代理下载 → 归档 → ingest
+    走 飞牛 trick: 不依赖 yt-dlp(反爬+amplify_video 不认),用 fxtwitter 拿 metadata + 最高码率视频流。
+    """
+    import re as _re
+    url = _re.sub(r'/video/\d+', '', url)  # 去掉 /video/1 后缀
+    m = _re.search(r'/([^/]+)/status/(\d+)', url)
+    if not m:
+        raise RuntimeError("X 链接格式错(需 /<user>/status/<id>)")
+    user, tid = m.group(1), m.group(2)
+    api = f"https://api.fxtwitter.com/{user}/status/{tid}"
+    with urllib.request.urlopen(api, timeout=20) as r:
+        d = json.loads(r.read().decode("utf-8", "ignore"))
+    tweet = d.get("tweet") or {}
+    text = (tweet.get("text") or "").strip()
+    author = (tweet.get("author") or {}).get("name") or "未知作者"
+    media_all = (tweet.get("media") or {}).get("all") or []
+    if not media_all:
+        raise RuntimeError("X 推文无媒体")
+
+    # 标题优先级
+    if text:
+        title = clean_title(text[:60]) or f"{author}_{tid[-8:]}"
+    else:
+        title = f"{author}_{tid[-8:]}"
+
+    # 选最高码率视频 or 第一张图
+    videos = [m_ for m_ in media_all if m_.get("type") in ("video", "gif")]
+    if videos:
+        variants = videos[0].get("variants") or []
+        mp4s = [v for v in variants if v.get("content_type") == "video/mp4"]
+        if mp4s:
+            best = max(mp4s, key=lambda v: v.get("bitrate", 0))
+            vurl = best["url"]
+            ext = "mp4"
+        else:
+            vurl = videos[0].get("url")
+            ext = "mp4"
+    else:
+        vurl = media_all[0].get("url", "")
+        ext = "jpg"
+
+    if not vurl:
+        raise RuntimeError("X 媒体 url 为空")
+
+    d = os.path.join(MEDIA, "X", today(), title)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{title}_1.{ext}")
+
+    # 下载（必须走代理 + 桌面 UA，否则 video.twimg.com 国内被墙）
+    UA_D = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    proxy_handler = urllib.request.ProxyHandler({"http": "http://127.0.0.1:20172",
+                                                  "https": "http://127.0.0.1:20172"})
+    opener = urllib.request.build_opener(proxy_handler)
+    opener.addheaders = [("User-Agent", UA_D)]
+    try:
+        with opener.open(vurl, timeout=120) as r:
+            data = r.read()
+    except Exception:
+        # 直连兜底
+        with urllib.request.urlopen(urllib.request.Request(vurl, headers={"User-Agent": UA_D}), timeout=120) as r:
+            data = r.read()
+    with open(path, "wb") as f:
+        f.write(data)
+
+    gen_thumb(d, title, is_video=(ext == "mp4"))
+    return os.path.join("X", today(), title), title, "X", author
+
+
+def ingest(rel, title, url, platform, author=None, avatar=None):
+    # ⚠ 参数一律用 --opt=value 形式：作者名可能以「-」开头(如 -哇咔咔咔咔)，
+    #   用空格分隔时 argparse 会把它当选项 → "expected one argument" → 入库静默失败
+    args = [PY, INGEST, f"--platform={platform}", f"--url={url}", f"--path={rel}", f"--title={title}"]
+    if author and author != "未知作者":
+        args.append(f"--author={author}")
+    if avatar:
+        args.append(f"--avatar={avatar}")
+    r = subprocess.run(args, capture_output=True, timeout=60)
     out = (r.stdout or b"").decode("utf-8", "ignore")
+    err = (r.stderr or b"").decode("utf-8", "ignore")
     # 去重拦截或被跳过：下载的文件不会入库 → 清掉已下载目录防残留
     if "已收藏过" in out or "跳过" in out:
         d = os.path.join(MEDIA, rel)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
         return False
+    if r.returncode != 0:
+        raise RuntimeError(f"入库失败({r.returncode}): {(err or out).strip()[:150]}")
     return True
 
 
@@ -454,12 +545,14 @@ def process_one(item):
         if "douyin" in url or "iesdouyin" in url:
             rel, title, plat, author = download_douyin(url)
         elif "xhslink" in url or "xiaohongshu" in url:
-            rel, title, plat = download_xiaohongshu(url)
+            rel, title, plat, avatar = download_xiaohongshu(url)
+        elif "x.com" in url or "twitter.com" in url:
+            rel, title, plat, author = download_x(url)
         else:
             item["status"] = "failed"
-            item["message"] = "不支持的平台(仅支持抖音/小红书)"
+            item["message"] = "不支持的平台(仅支持抖音/小红书/X)"
             return
-        ingest(rel, title, item.get("original_url") or url, plat, author=author or None)
+        ingest(rel, title, item.get("original_url") or url, plat, author=author or None, avatar=avatar if plat == "小红书" else None)
         item["status"] = "done"
         item["title"] = title
         item["path"] = rel
