@@ -43,12 +43,16 @@ def save_queue(q):
     os.replace(tmp, QUEUE)
 
 
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走代理
+
+
 def fetch(url, timeout=20, referer=None):
     headers = {"User-Agent": UA_I}
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    return urllib.request.urlopen(req, timeout=timeout).read()
+    # 直连：本机服务(localhost:8086 轻解析)若走 http_proxy 会被代理劫持报 502 Bad Gateway
+    return _OPENER.open(req, timeout=timeout).read()
 
 
 def clean_title(t):
@@ -223,14 +227,23 @@ def xhs_expand(url):
 
 def xhs_get_page(real_url, nid, tok):
     """抓页面。实测(2026-08-18): 带 cookie 反而触发反爬返回 ~10KB JS 壳，
-    不带 cookie + token + 桌面UA 成功(861KB 含 masterUrl)。token 失效时返回空壳→抛错"""
+    不带 cookie + token + 桌面UA 成功(861KB 含 masterUrl)。token 失效时返回空壳→抛错。
+    2026-09-14 补：先不带 cookie 试，失败再带 cookie（cookie 通道可救部分页面）。"""
     url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
     if tok:
         url += f"?xsec_source=app_share&xsec_token={tok}="
-    # 只试桌面 UA + token(不带cookie)，与手动 curl 成功方式一致
-    for ua in (UA_D, UA_I):
+    cookie_file = os.environ.get("XHS_COOKIE_FILE", "xhs_cookie.txt")
+    cookie = ""
+    if os.path.isfile(cookie_file):
+        cookie = open(cookie_file, encoding="utf-8").read().strip()
+    passes = [(UA_D, ""), (UA_I, "")]
+    if cookie:
+        passes += [(UA_I, cookie), (UA_D, cookie)]
+    for ua, ck in passes:
         try:
             headers = {"User-Agent": ua, "Referer": "https://www.xiaohongshu.com/"}
+            if ck:
+                headers["Cookie"] = ck
             req = urllib.request.Request(url, headers=headers)
             html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
             if len(html) > 10000 and ("masterUrl" in html or "imageList" in html or ("nickname" in html and '"title"' in html)):
@@ -240,15 +253,63 @@ def xhs_get_page(real_url, nid, tok):
     raise RuntimeError("小红书页面抓取失败(可能是 xsec_token 过期,需在App重新分享该链接)")
 
 
-def xhs_download_video(html, nid, title, author):
-    """挖 258/309 流下载视频"""
+def xhs_pick_stream(html):
+    """挑无水印流：优先 309(X265) → 258(X264) → 兜底第一个 masterUrl(通常 259 带水印)。
+    小红书页面里 259 流(MINI_APP_259)带作者头像+小红书 logo 水印，309/258 是干净原流。
+    实测判据：本地文件字节数 == 259 流 Content-Length 即为水印版。"""
+    for tag in ("309", "258"):
+        m = re.search(r'"masterUrl":"([^"]+_%s\.mp4[^"]*)"' % tag, html)
+        if m:
+            return m.group(1).replace("\\u002F", "/").replace("\\/", "/"), tag
     m = re.search(r'"masterUrl":"([^"]+)"', html)
     if not m:
+        return None, None
+    return m.group(1).replace("\\u002F", "/").replace("\\/", "/"), "259"
+
+
+def xhs_downloader_video(nid, real_url, title, d):
+    """用 XHS-Downloader 下视频(走官方签名接口，稳定拿 309 无水印流)。成功返回 True。"""
+    cookie_file = os.environ.get("XHS_COOKIE_FILE", "xhs_cookie.txt")
+    if not (os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV)):
+        return False
+    tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
+    url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
+    if tok:
+        url += f"?xsec_source=app_share&xsec_token={tok.group(1)}="
+    work = f"/tmp/xhs_vid_{nid}"
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        xhs_dir = os.environ.get("XHS_DIR", "xhs-downloader")
+        cookie = open(cookie_file, encoding="utf-8").read().strip()
+        subprocess.run([XHS_VENV, os.path.join(xhs_dir, "main.py"), "--url", url,
+                        "--cookie", cookie, "--work_path", work, "--download_record", "false"],
+                       capture_output=True, timeout=240)
+        mp4s = glob.glob(os.path.join(work, "Download", "**", "*.mp4"), recursive=True)
+        if not mp4s:
+            return False
+        src = max(mp4s, key=os.path.getsize)
+        if os.path.getsize(src) < 50000:
+            return False
+        shutil.copyfile(src, os.path.join(d, f"{title}.mp4"))
+        shutil.rmtree(work, ignore_errors=True)
+        return True
+    except Exception:
+        return False
+
+
+def xhs_download_video(html, nid, title, author, real_url=""):
+    """挖无水印流(309/258)下载视频；页面只有 259 水印流时改走 XHS-Downloader。"""
+    vurl, tag = xhs_pick_stream(html)
+    if not vurl:
         raise RuntimeError("无 masterUrl")
-    vurl = m.group(1).replace("\\u002F", "/").replace("\\/", "/")
-    data = fetch(vurl, timeout=120, referer="https://www.xiaohongshu.com/")
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
+    if tag == "259":
+        # 页面只给水印流 → 先试 XHS-Downloader(签名接口常能拿到 309)
+        if xhs_downloader_video(nid, real_url, title, d):
+            gen_thumb(d, title, is_video=True)
+            return os.path.join("小红书", today(), title)
+    data = fetch(vurl, timeout=120, referer="https://www.xiaohongshu.com/")
     with open(os.path.join(d, f"{title}.mp4"), "wb") as f:
         f.write(data)
     gen_thumb(d, title, is_video=True)
@@ -276,10 +337,17 @@ def xhs_download_images(html, nid, title, author, real_url):
                  "--url", url, "--cookie", cookie, "--work_path", work,
                  "--image_format", "PNG", "--download_record", "false"],
                 capture_output=True, timeout=150)
-            pngs = glob.glob(os.path.join(work, "Download", "**", "*.png"), recursive=True) + \
-                   glob.glob(os.path.join(work, "Download", "*.png"), recursive=True)
+            pngs = glob.glob(os.path.join(work, "Download", "**", "*.png"), recursive=True)
+            # 递归 glob 已含根目录，按 basename 去重（否则每张图会被复制两份）
+            seen, uniq = set(), []
+            for x in pngs:
+                k = os.path.basename(x)
+                if k in seen:
+                    continue
+                seen.add(k)
+                uniq.append(x)
+            pngs = sorted(uniq)
             if pngs:
-                pngs.sort()
                 for i, p in enumerate(pngs, 1):
                     shutil.copy(p, os.path.join(d, f"{title}_{i}.png"))
                 gen_thumb(d, title, is_video=False)
@@ -337,8 +405,9 @@ def download_xiaohongshu(url):
     ma = re.search(r'"nickname":"([^"]*)"', html)
     if ma:
         author = ma.group(1)
-    if typ == "video" or ('"masterUrl"' in html and '"imageList"' not in html):
-        rel = xhs_download_video(html, nid, title, author)
+    has_video = bool(re.search(r'"masterUrl":"[^"]+_(259|309|258)\.mp4', html))
+    if typ == "video" or has_video or ('"masterUrl"' in html and '"imageList"' not in html):
+        rel = xhs_download_video(html, nid, title, author, real_url=real)
         return rel, title, "小红书"
     else:
         rel = xhs_download_images(html, nid, title, author, real)

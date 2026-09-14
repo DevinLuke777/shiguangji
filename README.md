@@ -73,22 +73,49 @@ python3 gen_thumbs.py
 
 ## ⚠️ 踩坑记录
 
-1. 小红书 259 流带水印 → 必须抓 `_309.mp4` 流
-2. 小红书图文 CDN 图带水印 → 用 `ci.xiaohongshu.com/notes_pre_post/{id}` 通道
+1. 小红书 259 流带水印 → 必须抓 `_309.mp4` 流（**2026-09-14 实锤**：页面里流顺序是 `MINI_APP_259` 在前、`X265_MP4_WEB_309_h5` 在后，取「第一个 masterUrl」就会拿到水印版。判定法：本地文件字节数 == 259 流 `Content-Length` 即水印版）
+2. 小红书图文 CDN 图带水印 → 用 XHS-Downloader（官方签名接口）取无水印原图
 3. 图片条目必须生成 `_thumb.jpg`（否则卡片加载原图卡死）
 4. 外链头像不能直接渲染（手机浏览器打碎布局）→ 走 `/avatar/<id>` 代理
 5. 平台"X"标签显示为「推特」（避免误认关闭按钮）
 6. Docker 内 `MEDIA_ROOT=/media`（挂载点），宿主机脚本用实际路径
 7. `original_url` 不能存空串（UNIQUE 冲突）→ scan 用 `scan://路径` 占位
+8. 本机服务（`localhost:8086` 轻解析）**不能走 http 代理**，否则被劫持返回 502 Bad Gateway → worker 的 `fetch()` 用 `ProxyHandler({})` 直连
+9. 图文条目的图片用 `glob("Download/**/*.png")` 一次即可（递归已含根目录），再拼一次 `Download/*.png` 会导致每张图存两份
+
+## 📥 网页粘贴自动入库（download_worker.py）
+
+顶部输入框粘链接 → 写 `_queue.json` → 宿主机 worker（哨兵 3 秒轮询 / cron 兜底）处理：
+
+- **抖音**：轻解析服务解析 + 落盘，三重串号防护（清旧 untitled + 时间戳快照认领 + 认领即改名），空标题/同名自动 `_2/_3` 后缀
+- **小红书视频**：抓页面 → **优先 309 无水印流**（无 309 才退回 XHS-Downloader，最后才用 259）
+- **小红书图文**：XHS-Downloader 取无水印原图（失败降级 sns-webpic 带水印图）
+
+```bash
+python3 download_worker.py --drain     # 手动跑一次队列
+```
+
+## 🗓️ 更新记录
+
+**2026-09-14**
+- 🐛 **修复小红书视频水印 bug**：worker 原来取页面第一个 `masterUrl`（= 259 水印流），改为优先 309/258 无水印流；页面只给 259 时退回 XHS-Downloader 签名接口；页面抓取增加 cookie 兜底
+- 🐛 **修复图文图片每张存两份**：图片 glob 递归 + 根目录写了两遍，已去重
+- 🐛 **修复 502 Bad Gateway**：`fetch()` 走本机 8086 轻解析时被 http 代理劫持，改为直连（`ProxyHandler({})`）
+- 🐛 app.py：`local_path` 为空时列表页不再抛异常
+- 🧹 存量治理：全库小红书视频按 259/309 流字节数核对，水印版批量换 309；64 条图文条目重复图 md5 去重 + 重新编号
+
+**2026-08-23**
+- 队列页失败条目「🔄 重试」按钮（`/queue-retry`）；首屏缩略图提速（媒体文件 10 分钟缓存 + 前 12 张高优先级）
 
 ## 📁 项目结构
 
 ```
-app.py           # Web 应用（列表/详情/搜索/头像代理/自动建库）
-ingest.py        # 入库脚本（抓元数据 / 扫描目录）
-gen_thumbs.py    # 缩略图生成
-init_db.py       # 手动建库
-Dockerfile       # 镜像（python:3.11-slim + flask）
+app.py             # Web 应用（列表/详情/搜索/头像代理/自动建库/队列页）
+ingest.py          # 入库脚本（抓元数据 / 扫描目录）
+gen_thumbs.py      # 缩略图生成
+init_db.py         # 手动建库
+download_worker.py # 队列 worker（抖音/小红书自动下载归档入库）
+Dockerfile         # 镜像（python:3.11-slim + flask）
 docker-compose.yml
 ```
 

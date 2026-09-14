@@ -624,10 +624,11 @@ def index():
     conn.close()
     card_items = []
     for idx, it in enumerate(items):
-        files = list_files(it["local_path"])
+        lp = it["local_path"] or ""
+        files = list_files(lp)
         cover = None
         is_video = False
-        thumb = os.path.join(it["local_path"], "_thumb.jpg").replace("\\", "/")
+        thumb = os.path.join(lp, "_thumb.jpg").replace("\\", "/")
         if os.path.isfile(os.path.join(MEDIA_ROOT, thumb)):
             cover = thumb
         for f in files:
