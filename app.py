@@ -92,6 +92,13 @@ def add_link():
 
 
 # ─── 给 iOS 快捷指令 / 自动化用的极简接口 ──────────────
+def _api_reply(payload, raw=""):
+    """默认返回**纯文本**（快捷指令通知/朗读直接可用）；带 ?fmt=json 才返回 JSON。"""
+    if (request.values.get("fmt") or "").lower() == "json":
+        return jsonify(payload)
+    return Response(payload["msg"] + "\n", mimetype="text/plain; charset=utf-8")
+
+
 @app.route("/api/add", methods=["GET", "POST"])
 def api_add():
     """任意文本里抓 http(s) 链接丢进队列，返回 JSON。
@@ -108,7 +115,7 @@ def api_add():
             seen_links.add(cand)
             links.append(cand)
     if not links:
-        return jsonify({"ok": False, "added": 0, "msg": "没找到链接"})
+        return _api_reply({"ok": False, "added": 0, "dup": 0, "msg": "没找到链接"}, raw)
     q = load_queue()
     added, dup = [], []
     for link in links:
@@ -124,7 +131,7 @@ def api_add():
     msg = f"已加入队列 {len(added)} 条" if added else "已在队列中(跳过)"
     if dup and added:
         msg += f"，{len(dup)} 条重复"
-    return jsonify({"ok": True, "added": len(added), "dup": len(dup), "msg": msg})
+    return _api_reply({"ok": True, "added": len(added), "dup": len(dup), "msg": msg}, raw)
 
 @app.route("/queue-clear-failed", methods=["POST"])
 def queue_clear_failed():
