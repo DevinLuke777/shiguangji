@@ -115,6 +115,7 @@ def download_douyin(url):
             pass
     # 防护2: 调轻解析前记录目录快照
     pre_names = set(os.listdir(base))
+    started = time.time()
     # 调轻解析
     enc = urllib.parse.quote(real, safe="")
     api = f"http://localhost:8086/video/share/url/parse?url={enc}"
@@ -124,13 +125,22 @@ def download_douyin(url):
     data = d.get("data") or {}
     author = (data.get("author") or {}).get("name") or "未知作者"
     title = clean_title(data.get("title")) or author
-    # 等落盘: 只认"本次新出现"的目录（快照外的）
+    # 等落盘: 只认"本次新出现"的目录（快照外的），或**解析后被刷新的既有同名目录**
+    #（轻解析复用同名目录时不会出现在 new 里 → 只认 new 会误报「等待抖音落盘超时」）
+    def newest_mtime(p):
+        try:
+            return max((os.path.getmtime(os.path.join(p, f)) for f in os.listdir(p)), default=0)
+        except OSError:
+            return 0
+
     found = None
     waited = 0
     while waited < 90:
         now_names = set(os.listdir(base))
         new = now_names - pre_names
-        for name in new:
+        stale = [n for n in (now_names & pre_names)
+                 if os.path.isdir(os.path.join(base, n)) and newest_mtime(os.path.join(base, n)) >= started - 3]
+        for name in list(new) + stale:
             p = os.path.join(base, name)
             if os.path.isdir(p):
                 files = [f for f in os.listdir(p)]
