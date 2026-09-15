@@ -12,14 +12,14 @@
 import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.parse, shutil, glob
 from datetime import datetime
 
-MEDIA = "/vol1/1000/Downloads/拾光集"
+MEDIA = os.environ.get("MEDIA_ROOT", "/vol1/1000/Downloads/拾光集")   # 换成你的媒体根目录
 QUEUE = os.environ.get("QUEUE_FILE", os.path.join(MEDIA, "_queue.json"))
 LOCK = os.path.join(MEDIA, "_queue.lock")
-VALT = "/vol1/1000/Docker/shiguangji"  # ingest.py 所在(运行实例)
+VALT = os.environ.get("INGEST_DIR", "/vol1/1000/Docker/shiguangji")  # ingest.py 所在(运行实例)
 INGEST = os.path.join(VALT, "ingest.py")
 # 路径迁移：原飞牛 Hermes 已弃用，改用本地 Hermes venv
-PY = "/home/16675244747/.hermes/hermes-agent/venv/bin/python3"
-XHS_VENV = "/home/16675244747/.hermes/workspace/xhs-downloader/.venv/bin/python"   # XHS-Downloader 独立 venv（cookie 后续补）
+PY = os.environ.get("WORKER_PYTHON", "/home/16675244747/.hermes/hermes-agent/venv/bin/python3")
+XHS_VENV = os.environ.get("XHS_PYTHON", "/home/16675244747/.hermes/workspace/xhs-downloader/.venv/bin/python")  # XHS-Downloader 独立 venv
 
 UA_I = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 UA_D = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -251,7 +251,7 @@ def xhs_get_page(real_url, nid, tok):
     url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
     if tok:
         url += f"?xsec_source=app_share&xsec_token={tok}="
-    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
+    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
     cookie = open(cookie_file, encoding="utf-8").read().strip() if os.path.isfile(cookie_file) else ""
     passes = [(UA_D, ""), (UA_I, "")]
     if cookie:
@@ -287,7 +287,7 @@ def xhs_pick_stream(html):
 def xhs_downloader_video(nid, real_url, title, d):
     """用 XHS-Downloader 下视频(它走官方签名接口，稳定拿 309 无水印流)。
     成功返回 True。"""
-    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
+    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
     if not (os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV)):
         return False
     tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
@@ -341,7 +341,7 @@ def xhs_download_images(html, nid, title, author, real_url):
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
     # 尝试 XHS-Downloader(无水印原图)
-    cookie_file = "/home/16675244747/.hermes/workspace/xhs_cookie.txt"
+    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
     if os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV):
         tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
         url = f"https://www.xiaohongshu.com/discovery/item/{nid}"

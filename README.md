@@ -40,9 +40,32 @@ docker compose up -d --build
 
 ```bash
 pip install flask
-python3 init_db.py          # 建库
+python3 init_db.py          # 建库（Docker 方式会自动建，可跳过）
 MEDIA_ROOT=/path/to/media python3 app.py   # 启动 Web
 ```
+
+## ✅ 部署前须知（两条路，选你要的）
+
+**A. 只要「网页媒体库」**（最小部署，3 步搞定）
+1. `docker compose up -d --build`
+2. 把已有媒体按 `平台/日期/标题/文件` 放进媒体目录
+3. `python3 ingest.py --scan`（在宿主机跑，Python 3 + 标准库即可）扫描补录进库
+
+不部署下面那层，网页照样能浏览、搜索、播放，只是不能「粘链接自动下载」。
+
+**B. 再加「粘链接自动采集」**（进阶，需要额外自建服务）
+
+| 组件 | 作用 | 依赖 |
+|---|---|---|
+| `download_worker.py` | 队列工人：下载 → 归档 → 入库 | Python 3 |
+| 哨兵（`while true` 循环跑 `--drain`）或 cron 每分钟跑一次 | 自动触发 | — |
+| 轻解析服务（`localhost:8086`） | 抖音解析 + 落盘 | **需自建**（本仓库不含） |
+| XHS-Downloader | 小红书图文/视频兜底下载 | **需自建** + 小红书 cookie |
+| 公网入口（可选 Cloudflare Tunnel） | 手机在外面也能提交链接 | — |
+
+worker 的环境变量（都能覆盖脚本里的默认值）：`MEDIA_ROOT`（媒体根目录）、`INGEST_DIR`（ingest.py 所在目录）、`WORKER_PYTHON`、`XHS_PYTHON`（XHS-Downloader 的 venv python）、`XHS_DIR`、`XHS_COOKIE_FILE`（cookie 文件）、`QUEUE_FILE`。细节见下面「网页粘贴自动入库」一节。
+
+> **最容易踩的坑**：Docker 部署时**不要把宿主空目录挂到 `/app`** —— 那会盖掉镜像里的 `app.py`，页面直接空白/404。数据库请挂 `/data`（见 `docker-compose.yml`）。
 
 ## 📥 内容入库
 
@@ -97,6 +120,7 @@ python3 download_worker.py --drain     # 手动跑一次队列
 
 ## 🗓️ 更新记录
 
+- 🧩 **开源可部署性打磨**：compose 服务名统一 shiguangji、新增「部署前须知」（最小部署 vs 进阶采集两条路 + 挂载坑）、worker 关键路径全部支持环境变量覆盖（默认值不变）
 **2026-09-14**
 - 🐛 **修复小红书视频水印 bug**：worker 原来取页面第一个 `masterUrl`（= 259 水印流），改为优先 309/258 无水印流；页面只给 259 时退回 XHS-Downloader 签名接口；页面抓取增加 cookie 兜底
 - 🐛 **修复图文图片每张存两份**：图片 glob 递归 + 根目录写了两遍，已去重

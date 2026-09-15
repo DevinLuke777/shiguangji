@@ -1,13 +1,16 @@
 services:
-  media-vault:
+  shiguangji:
     build: .
-    container_name: media-vault
+    container_name: shiguangji
     restart: always
     ports:
       - "8090:8090"
     volumes:
-      - ./media-vault-data:/data          # SQLite 数据库持久化
-      - /path/to/your/media:/media:ro     # ⚠️ 改成你的媒体目录（平台/日期/标题结构）
+      - ./shiguangji-data:/data          # SQLite 数据库持久化（自动创建）
+      - /path/to/your/media:/media:ro    # ⚠️ 改成你的媒体目录（平台/日期/标题 结构）
     environment:
       - MEDIA_ROOT=/media
       - DB_PATH=/data/media_library.db
+
+# ⚠️ 注意：不要把空的宿主目录挂到 /app 覆盖代码
+#    镜像已 COPY app.py；数据库请走 /data（见上），媒体目录挂 /media
