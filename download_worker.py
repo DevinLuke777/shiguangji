@@ -9,7 +9,7 @@
 用法: python3 download_worker.py --drain    # 处理一次队列里所有 pending
 用系统/Hermes cron 每 2 分钟调用一次; stdout 为空=静默(成功不打扰)。
 """
-import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.parse, shutil, glob
+import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.parse, shutil, glob, sqlite3
 from datetime import datetime
 
 MEDIA = os.environ.get("MEDIA_ROOT", "/vol1/1000/Downloads/拾光集")   # 换成你的媒体根目录
@@ -110,7 +110,7 @@ def download_douyin(url):
         short = re.search(r"https://v\.douyin\.com/[A-Za-z0-9_-]+/?", url)
         if short:
             try:
-                real = urllib.request.urlopen(urllib.request.Request(short.group(0), headers={"User-Agent": UA_I}), timeout=15).geturl()
+                real = _OPENER.open(urllib.request.Request(short.group(0), headers={"User-Agent": UA_I}), timeout=15).geturl()
             except Exception:
                 real = url
     base = os.path.join(MEDIA, "抖音", today())
@@ -225,7 +225,7 @@ def download_douyin(url):
 # ── 小红书 ─────────────────────────────────────────────
 def xhs_expand(url):
     """展开 xhslink 短链，返回 (real_url, note_id, xsec_token, type)"""
-    r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15)
+    r = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15)
     real = r.geturl()
     m = re.search(r"/discovery/item/([a-f0-9]{24})", real)
     if not m:
@@ -262,7 +262,7 @@ def xhs_get_page(real_url, nid, tok):
             if ck:
                 headers["Cookie"] = ck
             req = urllib.request.Request(url, headers=headers)
-            html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
+            html = _OPENER.open(req, timeout=25).read().decode("utf-8", "ignore")
             if len(html) > 10000 and ("masterUrl" in html or "imageList" in html or ("nickname" in html and '"title"' in html)):
                 return html, nid
         except Exception:
@@ -442,6 +442,156 @@ def download_xiaohongshu(url):
 
 # ── 主流程 ─────────────────────────────────────────────
 
+# ── 微博 (2026-09-21, 新增自动通道) ──────────────────────────────
+def _wb_pid_from_url(u):
+    """从图片 URL 抽 pid: wx3.sinaimg.cn/mw2000/<pid>.jpg → pid"""
+    m = re.search(r"/(?:mw2000|large|orj\d+|original)/([a-zA-Z0-9]+)\.", u)
+    return m.group(1) if m else None
+
+
+def download_weibo(url):
+    """微博链接: 走轻解析拿元数据+图片+live 图+视频,
+    原图用 wx1.sinaimg.cn/original/{pid}.jpg 替换压缩图, live 图下 mov 配对.
+    返回 (relative_path, title, platform, author)."""
+    # 1) 短链展开 (weibo.com / m.weibo.cn 都接)
+    real = url
+    if "t.cn" in url or "/short/" in url:
+        # 短链走 _OPENER,不要走代理
+        try:
+            real = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15).geturl()
+        except Exception:
+            real = url
+    # 2) 调轻解析
+    enc = urllib.parse.quote(real, safe="")
+    api = f"http://localhost:8086/video/share/url/parse?url={enc}"
+    last_err = None
+    d = None
+    for attempt in range(2):
+        try:
+            d = json.loads(fetch(api, timeout=60).decode("utf-8", "ignore"))
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(3)
+    if d is None:
+        raise RuntimeError(f"轻解析微博接口两次失败: {last_err}")
+    if d.get("code") != 200:
+        raise RuntimeError(f"轻解析微博失败: {d.get('msg','?')}")
+    data = d.get("data") or {}
+    raw_title = (data.get("title") or "").strip()
+    title = clean_title(raw_title) or "微博"
+    author = (data.get("author") or {}).get("name") or "微博用户"
+    video_url = data.get("video_url") or ""
+    images = data.get("images") or []
+
+    if not video_url and not images:
+        raise RuntimeError("微博无媒体(图/视频都没有)")
+
+    base = os.path.join(MEDIA, "微博", today(), title)
+    os.makedirs(base, exist_ok=True)
+
+    saved_video = False
+    # 3) 优先视频
+    if video_url:
+        try:
+            r = _OPENER.open(urllib.request.Request(video_url, headers={
+                "User-Agent": UA_I,
+                "Referer": "https://weibo.com/",
+            }), timeout=120)
+            data_bytes = r.read()
+            with open(os.path.join(base, f"{title}.mp4"), "wb") as f:
+                f.write(data_bytes)
+            saved_video = True
+        except Exception as e:
+            WARN.append(f"微博视频下载失败: {str(e)[:80]}")
+
+    # 4) 图文帖: 下载原图 + live 图配对
+    saved_n = 0
+    if not saved_video and images:
+        for idx, im in enumerate(images, 1):
+            short_url = im.get("url") or ""
+            live_url = im.get("live_photo_url") or ""
+            pid = _wb_pid_from_url(short_url)
+            orig_url = f"https://wx1.sinaimg.cn/original/{pid}.jpg" if pid else short_url
+            try:
+                r = _OPENER.open(urllib.request.Request(orig_url, headers={
+                    "User-Agent": UA_I,
+                    "Referer": "https://weibo.com/",
+                }), timeout=60)
+                with open(os.path.join(base, f"{title}_{idx}.jpg"), "wb") as f:
+                    f.write(r.read())
+                saved_n += 1
+            except Exception:
+                # 原图失败: 退回 mw2000 压缩图
+                if short_url:
+                    try:
+                        r = _OPENER.open(urllib.request.Request(short_url, headers={
+                            "User-Agent": UA_I,
+                            "Referer": "https://weibo.com/",
+                        }), timeout=60)
+                        with open(os.path.join(base, f"{title}_{idx}.jpg"), "wb") as f:
+                            f.write(r.read())
+                        saved_n += 1
+                    except Exception:
+                        pass
+            # live 图配对
+            if live_url:
+                try:
+                    rr = _OPENER.open(urllib.request.Request(live_url, headers={
+                        "User-Agent": UA_I,
+                        "Referer": "https://weibo.com/",
+                    }), timeout=60)
+                    with open(os.path.join(base, f"{title}_live{idx}.mov"), "wb") as f:
+                        f.write(rr.read())
+                except Exception:
+                    pass  # live 图失败不阻塞图文入库
+
+    if not saved_video and saved_n == 0:
+        raise RuntimeError("微博媒体下载全部失败(原图+压缩图都拿不到)")
+
+    # 清理 lite.parser 残留的同内容孤儿目录(轻解析会 auto_save,带 #话题标签 尾)
+    # - 条件: 同日期目录下 + lite.parser 用户 + 标题是我们 clean_title 后的标题
+    #   (lite.parser 不清理 # 标签,所以带 # 尾的就是它的产物)
+    # - 仅当不在 DB 引用列表里才删(防误删已收藏内容)
+    try:
+        import pwd as _pwd
+        date_dir = os.path.dirname(rel)
+        full_date = os.path.join(MEDIA, date_dir)
+        if os.path.isdir(full_date):
+            conn = sqlite3.connect(os.path.join(VALT, "media_library.db"))
+            refs = {r[0] for r in conn.execute("SELECT local_path FROM items WHERE local_path LIKE ?", (date_dir + "/%",))}
+            conn.close()
+            for sibling in os.listdir(full_date):
+                if sibling == title or sibling == os.path.basename(rel):
+                    continue
+                full = os.path.join(full_date, sibling)
+                if not os.path.isdir(full):
+                    continue
+                # 必须是 lite.parser 用户(worker 是当前用户)+ 带 # 标签(轻解析的特征)
+                try:
+                    own = _pwd.getpwuid(os.stat(full).st_uid).pw_name
+                except Exception:
+                    continue
+                if own != "lite.parser":
+                    continue
+                if "#" not in sibling:
+                    continue
+                # 兄弟目录的 rel
+                sib_rel = os.path.join(date_dir, sibling)
+                if sib_rel in refs:
+                    continue  # DB 已引用,不删
+                try:
+                    shutil.rmtree(full)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    rel = os.path.join("微博", today(), title)
+    gen_thumb(base, title, is_video=saved_video)
+    return rel, title, "微博", author
+
+
 # ── X / Twitter (2026-09-09) ──────────────────────────────
 def download_x(url):
     """X/Twitter 链接: fxtwitter API 解析 → 桌面 UA + 代理下载 → 归档 → ingest
@@ -454,7 +604,7 @@ def download_x(url):
         raise RuntimeError("X 链接格式错(需 /<user>/status/<id>)")
     user, tid = m.group(1), m.group(2)
     api = f"https://api.fxtwitter.com/{user}/status/{tid}"
-    with urllib.request.urlopen(api, timeout=20) as r:
+    with _OPENER.open(api, timeout=20) as r:
         d = json.loads(r.read().decode("utf-8", "ignore"))
     tweet = d.get("tweet") or {}
     text = (tweet.get("text") or "").strip()
@@ -558,9 +708,11 @@ def process_one(item):
             rel, title, plat, avatar = download_xiaohongshu(url)
         elif "x.com" in url or "twitter.com" in url:
             rel, title, plat, author = download_x(url)
+        elif "weibo.com" in url or "m.weibo.cn" in url or "t.cn" in url:
+            rel, title, plat, author = download_weibo(url)
         else:
             item["status"] = "failed"
-            item["message"] = "不支持的平台(仅支持抖音/小红书/X)"
+            item["message"] = "不支持的平台(仅支持抖音/小红书/X/微博)"
             return
         ingest(rel, title, item.get("original_url") or url, plat, author=author or None, avatar=avatar if plat == "小红书" else None)
         item["status"] = "done"
