@@ -14,6 +14,29 @@ MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/media")
 
 app = Flask(__name__)
 
+
+# 有些浏览器（iOS/安卓 App 内置浏览器、手机 WebView）不看 <link rel="icon">，
+# 而是直接来要 /favicon.ico —— 不加这两条路由它们就只能拿到 404，图标就空着 ✗
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+@app.route("/favicon.ico")
+def _favicon_ico():
+    p = os.path.join(_STATIC_DIR, "favicon.ico")
+    if not os.path.exists(p):
+        return Response(status=404)
+    with open(p, "rb") as fh:
+        return Response(fh.read(), mimetype="image/vnd.microsoft.icon")
+
+
+@app.route("/apple-touch-icon.png")
+def _apple_touch_icon():
+    p = os.path.join(_STATIC_DIR, "favicon.png")
+    if not os.path.exists(p):
+        return Response(status=404)
+    with open(p, "rb") as fh:
+        return Response(fh.read(), mimetype="image/png")
+
 VIDEO_EXT = (".mp4", ".mov", ".mkv", ".webm")
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
@@ -38,6 +61,7 @@ def save_queue(q):
 
 Q_HEAD = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<link rel="icon" type="image/png" href="/static/favicon.png"><link rel="apple-touch-icon" href="/static/favicon.png">
 <title>队列 - 拾光集</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--accent:#0071e3;--bg:#f7f7f8;--card:#fff;--text:#18181b;--sub:#71717a;--border:#e8e8ec;--fill:#f0f0f4;--fill2:#a3a3ad;--shadow:0 1px 4px rgba(0,0,0,.06);--danger:#6e6e73;--bar-bg:rgba(255,255,255,.72);--bar-line:rgba(0,0,0,.06)}
@@ -110,7 +134,8 @@ def api_add():
         raw = request.get_data(as_text=True)[:4000]
     links, seen_links = [], set()
     for cand in re.findall(r"https?://[^\s\u4e00-\u9fff,，、；;：:）)】\]]+", raw):
-        cand = cand.rstrip(".,;:!?，。；：！？")
+        # 剪掉尾随的标点/引号/括号（快捷指令用 JSON 发时会把 "} 粘上来）
+        cand = cand.rstrip(".,;:!?，。；：！？\"'}])>»\\")
         if cand and cand not in seen_links:
             seen_links.add(cand)
             links.append(cand)
@@ -227,6 +252,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<link rel="icon" type="image/png" href="/static/favicon.png"><link rel="apple-touch-icon" href="/static/favicon.png">
 <title>拾光集</title>
 <style>
 :root{--accent:#0071e3;--bg:#f7f7f8;--card:#fff;--text:#18181b;--sub:#71717a;--border:#e8e8ec;--fill:#f0f0f4;--fill2:#a3a3ad;--body:#444;--bar-bg:rgba(255,255,255,.72);--bar-line:rgba(0,0,0,.06);--shadow:0 1px 4px rgba(0,0,0,.06);--shadow-lg:0 2px 16px rgba(0,0,0,.12);--danger:#6e6e73;--radius:14px}
@@ -479,6 +505,7 @@ DETAIL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png"><link rel="apple-touch-icon" href="/static/favicon.png">
 <title>{{ it['title'] or '详情' }} - 拾光集</title>
 <style>
 :root{--accent:#0071e3;--bg:#f7f7f8;--card:#fff;--text:#18181b;--sub:#71717a;--border:#e8e8ec;--fill:#f0f0f4;--fill2:#a3a3ad;--body:#444;--shadow:0 2px 10px rgba(0,0,0,.06);--shadow-lg:0 2px 16px rgba(0,0,0,.12);--danger:#6e6e73;--radius:14px}
@@ -719,6 +746,7 @@ STATS_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png"><link rel="apple-touch-icon" href="/static/favicon.png">
 <title>统计 - 拾光集</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
