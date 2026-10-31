@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.parse
@@ -64,7 +65,8 @@ def gen_thumb(d, title, is_video):
     """生成 _thumb.jpg：定位源文件（video 找 {title}.mp4，image 找第一张图）后调 ffmpeg"""
     src = os.path.join(d, f"{title}.mp4") if is_video else os.path.join(d, f"{title}_1.png")
     if not os.path.isfile(src):
-        cands = sorted(glob.glob(os.path.join(d, "*.png")) + glob.glob(os.path.join(d, "*.jpg")))
+        cands = sorted(glob.glob(os.path.join(d, "*.png")) + glob.glob(os.path.join(d, "*.jpg"))
+                       + glob.glob(os.path.join(d, "*.jpeg")) + glob.glob(os.path.join(d, "*.webp")))
         if not cands:
             return
         src = cands[0]
@@ -280,6 +282,48 @@ def xhs_download_video(html, nid, title, author, real_url=""):
     return os.path.join("小红书", today(), title)
 
 
+def xhs_api_download(nid, real_url, title, d):
+    """走小红书签名接口（xhs_api.py）：图文原图 + 实况 Live 视频一起下。
+    成功返回 True。文件命名成 <title>_N.ext / <title>_N.mp4，详情页靠同名自动配对成 Live。"""
+    global SRC_TAG
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_api.py")
+    if not (XHS_VENV and os.path.isfile(XHS_VENV) and os.path.isfile(script)):
+        return False
+    tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+=*)", real_url or "")
+    url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
+    if tok:
+        url += f"?xsec_source=app_share&xsec_token={tok.group(1)}"
+    tmp = tempfile.mkdtemp(prefix="xhs_api_")
+    try:
+        env = dict(os.environ, XHS_DIR=XHS_DIR or "", XHS_COOKIE_FILE=XHS_COOKIE_FILE or "")
+        r = subprocess.run([XHS_VENV, script, url, tmp], capture_output=True, text=True,
+                           timeout=420, env=env)
+        out = (r.stdout or "").strip().splitlines()
+        data = json.loads(out[-1]) if out and out[-1].startswith("{") else {}
+        if not data.get("ok"):
+            return False
+        got = 0
+        for name in data.get("files", []) + data.get("live", []):
+            src = os.path.join(tmp, name)
+            if not os.path.isfile(src):
+                continue
+            m = re.search(r"_(\d+)\.[A-Za-z0-9]+$", name)
+            idx = m.group(1) if m else str(got + 1)
+            ext = name.rsplit(".", 1)[-1].lower()
+            dst = os.path.join(d, f"{title}_{idx}.{ext}")
+            shutil.move(src, dst)
+            got += 1
+        if got:
+            SRC_TAG = "orig"
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"签名接口下载失败: {e}")
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def xhs_download_images(html, nid, title, author, real_url):
     """图文: 优先 XHS-Downloader 无水印原图; 失败降级 sns-webpic 直抓。
     Live 图: 解析页面 livePhoto 字段，配对下载 mp4（{title}_live{i}.mp4）"""
@@ -287,6 +331,11 @@ def xhs_download_images(html, nid, title, author, real_url):
     SRC_TAG = "orig"
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
+
+    # 优先走签名接口（原图 + 实况 Live）
+    if xhs_api_download(nid, real_url, title, d):
+        gen_thumb(d, title, is_video=False)
+        return os.path.join("小红书", today(), title)
 
     # ── 解析 Live 图视频 URL（小红书页面 imageList 里的 livePhoto 字段）──
     # 格式: "livePhotoUrl":"https://.../xxx.mp4" 或 "livePhoto":"..."
@@ -961,6 +1010,16 @@ def process_one(item):
     if item.get("type") == "profile":
         process_profile(item)
         return
+    # 抖音短链可能指向作者主页（不是单条视频）：展开后识别，给出明确提示
+    if "v.douyin.com" in url:
+        try:
+            real = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_MOBILE}), timeout=15).geturl()
+        except Exception:
+            real = url
+        if "/share/user/" in real or "/user/" in real:
+            item["status"] = "failed"
+            item["message"] = "这是作者主页链接，不是单条视频；抖音主页批量抓取需浏览器解析，暂不支持"
+            return
     try:
         author = None
         avatar = None

@@ -342,6 +342,44 @@ def migrate_db() -> None:
             log.info("迁移: v4 — 添加 src_tag/wm_flag 字段")
 
 
+        # v5: 回填 cover_path + 纠正 media_type（按目录实际文件，修新入库为空/错标的情况）
+        if current < 5:
+            media_root = os.environ.get("MEDIA_ROOT", "")
+            img_ext = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+            vid_ext = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
+            fixed_cover = fixed_type = 0
+            for item_id, rel, cov, mt in cur.execute(
+                    "SELECT id, local_path, cover_path, media_type FROM items").fetchall():
+                if not rel or not media_root:
+                    continue
+                full = os.path.join(media_root, rel)
+                if not os.path.isdir(full):
+                    continue
+                try:
+                    names = [n for n in os.listdir(full) if not n.startswith(".")]
+                except OSError:
+                    continue
+                imgs = [n for n in names if n.lower().endswith(img_ext)
+                        and "_thumb" not in n.lower() and "_live" not in n.lower()]
+                vids = [n for n in names if n.lower().endswith(vid_ext) and "_live" not in n.lower()]
+                new_type = "video" if (vids and not imgs) else ("image" if imgs else mt)
+                if new_type and new_type != mt:
+                    cur.execute("UPDATE items SET media_type=? WHERE id=?", (new_type, item_id))
+                    fixed_type += 1
+                if not cov:
+                    cover = ""
+                    if "_thumb.jpg" in names:
+                        cover = os.path.join(rel, "_thumb.jpg").replace("\\", "/")
+                    elif imgs:
+                        cover = os.path.join(rel, sorted(imgs)[0]).replace("\\", "/")
+                    elif vids:
+                        cover = os.path.join(rel, "_thumb.jpg").replace("\\", "/")
+                    if cover:
+                        cur.execute("UPDATE items SET cover_path=? WHERE id=?", (cover, item_id))
+                        fixed_cover += 1
+            _set_schema_version(cur, 5)
+            log.info(f"迁移: v5 — 补封面 {fixed_cover} 条，纠正类型 {fixed_type} 条")
+
         conn.commit()
     finally:
         conn.close()

@@ -56,15 +56,15 @@
         {% for f in ns.imgs %}
         {% set img_idx = loop.index0 %}
         {% set bname = f.rsplit('.', 1)[0] %}
-        {% set live_match = none %}
+        {% set mt = namespace(v=none) %}
         {% for lv in ns.lives %}
-          {% if lv.rsplit('.', 1)[0] == bname %}{% set live_match = lv %}{% endif %}
+          {% if lv.rsplit('.', 1)[0] == bname %}{% set mt.v = lv %}{% endif %}
         {% endfor %}
-        <div class="grid-item{% if live_match %} has-live{% endif %}"
-             {% if live_match %}data-live="{{ url_for('media', relpath=live_match) }}"{% endif %}
+        <div class="grid-item{% if mt.v %} has-live{% endif %}"
+             {% if mt.v %}data-live="{{ url_for('media', relpath=mt.v) }}"{% endif %}
              onclick="openLb({{ img_idx }})">
           <img src="{{ url_for('media', relpath=f) }}" loading="lazy">
-          {% if live_match %}<span class="live-badge">▶ Live</span>{% endif %}
+          {% if mt.v %}<span class="live-badge">▶ Live</span>{% endif %}
         </div>
         {% endfor %}
       </div>
@@ -75,8 +75,9 @@
         <div class="live-title">🎬 Live 图 ({{ ns.lives|length }} 个) · 长按图片看动效 <a href="javascript:void(0)" onclick="saveLivePhotos({{ it['id'] }})" class="live-save-link">存到相册</a></div>
         <p class="live-hint" id="liveHint" style="display:none"></p>
         {% for f in ns.lives %}
-        <div class="video-wrap live-wrap" style="display:none">
-          <video preload="metadata" playsinline loop
+        <div class="video-wrap live-wrap" style="display:inline-block;width:150px;margin:4px 6px 4px 0">
+          <video preload="metadata" playsinline loop muted controls
+                 style="width:100%;height:auto;border-radius:10px"
                  src="{{ url_for('media', relpath=f) }}"
                  data-pid="{{ it['id'] }}_live{{ loop.index }}"></video>
         </div>
