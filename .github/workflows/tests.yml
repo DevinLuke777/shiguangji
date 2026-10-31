@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask
+          # ffmpeg 用于 gen_thumbs 测试（可选）
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Syntax check
+        run: |
+          python -m py_compile config.py logger.py db.py utils.py queue_manager.py app.py ingest.py download_worker.py gen_thumbs.py init_db.py
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
