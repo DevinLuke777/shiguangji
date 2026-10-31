@@ -11,6 +11,9 @@ services:
     environment:
       - MEDIA_ROOT=/media
       - DB_PATH=/data/media_library.db
+      - ITEMS_PER_PAGE=40
+      - LOG_LEVEL=INFO
 
 # ⚠️ 注意：不要把空的宿主目录挂到 /app 覆盖代码
-#    镜像已 COPY app.py；数据库请走 /data（见上），媒体目录挂 /media
+#    镜像已 COPY 全部代码；数据库请走 /data（见上），媒体目录挂 /media
+#    如需启用队列 worker（粘贴链接自动入库），在宿主机跑 download_worker.py

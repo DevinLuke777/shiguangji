@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% block title %}{{ it['title'] or '详情' }} - 拾光集{% endblock %}
+{% block content %}
+<div class="page">
+  <a class="back" href="/">← 返回</a>
+  <div class="card-box">
+    <div class="title">{{ it['title'] or '无标题' }}</div>
+    <div style="padding:4px 16px 0;font-size:11px;color:var(--sub)">ID: <code style="background:var(--fill);padding:1px 6px;border-radius:4px;color:var(--sub)">{{ it['id'] }}</code></div>
+    <div class="author-bar">
+      <img class="av" src="/avatar/{{ it['id'] }}" onerror="this.classList.add('hide')">
+      <a class="name" href="/?author={{ it['author_name']|urlencode }}">{{ it['author_name'] or '未知作者' }}</a>
+      <span class="plat t-{{ it['platform'] }}">{{ '推特' if it['platform'] == 'X' else it['platform'] }}</span>
+      <span class="time" style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;line-height:1.3"><span>🕐 {{ it['post_date'][:19] if it['post_date'] else '' }}</span><span>📥 {{ it['created_at'][:19] if it['created_at'] else '' }}</span></span>
+    </div>
+    {% if it['content'] %}<div class="content">{{ it['content'] }}</div>{% endif %}
+
+    <div class="media-area">
+      {% set ns = namespace(imgs=[], vids=[], lives=[]) %}
+      {% set ns.img_basenames = [] %}
+      {% for f in files %}
+        {% if f.lower().endswith(('.mp4','.mov','.mkv','.webm')) %}
+          {# 判断是否 live 视频：有同名图片（basename 相同，扩展名不同）#}
+          {% set bname = f.rsplit('.', 1)[0] %}
+          {% set has_img = namespace(val=false) %}
+          {% for ff in files %}
+            {% if ff.rsplit('.', 1)[0] == bname and ff.lower().endswith(('.jpg','.jpeg','.png','.webp','.gif')) %}
+              {% set has_img.val = true %}
+            {% endif %}
+          {% endfor %}
+          {% if has_img.val %}
+            {% set ns.lives = ns.lives + [f] %}
+          {% else %}
+            {% set ns.vids = ns.vids + [f] %}
+          {% endif %}
+        {% elif f.lower().endswith(('.jpg','.jpeg','.png','.webp','.gif')) %}
+          {% set ns.imgs = ns.imgs + [f] %}
+          {% set ns.img_basenames = ns.img_basenames + [f.rsplit('.', 1)[0]] %}
+        {% endif %}
+      {% endfor %}
+      {% for f in ns.vids %}
+      <div class="video-wrap">
+        <video controls preload="metadata" playsinline
+               src="{{ url_for('media', relpath=f) }}"
+               data-pid="{{ it['id'] }}"></video>
+        <div class="vctrl">
+          <button class="vbtn" onclick="vSpeed(this)" data-rate="1">1x</button>
+          <button class="vbtn" onclick="vLoop(this)">↻ 循环</button>
+          <button class="vbtn" onclick="vPiP(this)">⧉ 画中画</button>
+        </div>
+      </div>
+      {% endfor %}
+      {% if ns.imgs|length == 1 %}
+      <img class="single-img" src="{{ url_for('media', relpath=ns.imgs[0]) }}" loading="lazy" onclick="openLb(0)">
+      {% elif ns.imgs|length > 1 %}
+      <div class="img-grid">
+        {% for f in ns.imgs %}
+        {% set img_idx = loop.index0 %}
+        {% set bname = f.rsplit('.', 1)[0] %}
+        {% set live_match = none %}
+        {% for lv in ns.lives %}
+          {% if lv.rsplit('.', 1)[0] == bname %}{% set live_match = lv %}{% endif %}
+        {% endfor %}
+        <div class="grid-item{% if live_match %} has-live{% endif %}"
+             {% if live_match %}data-live="{{ url_for('media', relpath=live_match) }}"{% endif %}
+             onclick="openLb({{ img_idx }})">
+          <img src="{{ url_for('media', relpath=f) }}" loading="lazy">
+          {% if live_match %}<span class="live-badge">▶ Live</span>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {# Live 图视频区（独立播放，配对图片上方）#}
+      {% if ns.lives %}
+      <div class="live-section">
+        <div class="live-title">🎬 Live 图 ({{ ns.lives|length }} 个) · 长按图片看动效 <a href="javascript:void(0)" onclick="saveLivePhotos({{ it['id'] }})" class="live-save-link">存到相册</a></div>
+        <p class="live-hint" id="liveHint" style="display:none"></p>
+        {% for f in ns.lives %}
+        <div class="video-wrap live-wrap" style="display:none">
+          <video preload="metadata" playsinline loop
+                 src="{{ url_for('media', relpath=f) }}"
+                 data-pid="{{ it['id'] }}_live{{ loop.index }}"></video>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    {% if it['original_url'] %}<div class="orig">🔗 <a href="{{ it['original_url'] }}" target="_blank">{{ it['original_url'] }}</a></div>{% endif %}
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <form method="post" action="/delete/{{ it['id'] }}" onsubmit="return confirm('确定删除这条收藏？本地文件也会一并删除！')">
+        <button type="submit" class="del-btn">🗑️ 删除这条收藏</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% if ns.imgs %}
+<div class="lb" id="lb" onclick="closeLb(event)">
+  <span class="x" onclick="closeLb(event)">&times;</span>
+  <span class="nav l" onclick="lbStep(event,-1)">&#10094;</span>
+  <img id="lbImg" src="">
+  <span class="nav r" onclick="lbStep(event,1)">&#10095;</span>
+  <div class="lb-tools">
+    <span class="cnt" id="lbCnt"></span>
+    <button class="lb-btn" onclick="lbRotate()">⟳ 旋转</button>
+    <button class="lb-btn" onclick="lbZoom(1.25)">＋ 放大</button>
+    <button class="lb-btn" onclick="lbZoom(0.8)">－ 缩小</button>
+    <button class="lb-btn" onclick="lbReset()">↺ 重置</button>
+  </div>
+</div>
+<script>
+var imgs={{ ns.imgs|map('urlencode')|list|tojson }},idx=0,base="{{ url_for('media', relpath='') }}";
+var lbScale=1,lbRot=0;
+function openLb(i){idx=i;lbScale=1;lbRot=0;document.getElementById('lb').classList.add('on');show()}
+function show(){
+  var img=document.getElementById('lbImg');
+  img.src=base+imgs[idx];
+  img.style.transform='scale('+lbScale+') rotate('+lbRot+'deg)';
+  document.getElementById('lbCnt').textContent=(idx+1)+'/'+imgs.length;
+}
+function closeLb(e){if(e.target.tagName==='IMG'||e.target.classList.contains('nav')||e.target.classList.contains('lb-btn'))return;document.getElementById('lb').classList.remove('on')}
+function lbStep(e,d){e.stopPropagation();idx=(idx+d+imgs.length)%imgs.length;lbScale=1;lbRot=0;show()}
+function lbZoom(f){lbScale=Math.max(0.5,Math.min(4,lbScale*f));show()}
+function lbRotate(){lbRot+=90;show()}
+function lbReset(){lbScale=1;lbRot=0;show()}
+document.addEventListener('keydown',function(e){
+  var lb=document.getElementById('lb');
+  if(!lb.classList.contains('on'))return;
+  if(e.key==='Escape')lb.classList.remove('on');
+  if(e.key==='ArrowLeft')lbStep(e,-1);
+  if(e.key==='ArrowRight')lbStep(e,1);
+  if(e.key==='+'||e.key==='=')lbZoom(1.25);
+  if(e.key==='-')lbZoom(0.8);
+  if(e.key==='r'||e.key==='R')lbRotate();
+});
+</script>
+{% endif %}
+
+<script>
+/* ── 视频播放增强 ── */
+// 播放速度切换：1x → 1.25x → 1.5x → 2x → 0.5x → 1x
+function vSpeed(btn){
+  var v=btn.closest('.video-wrap').querySelector('video');
+  var rates=[1,1.25,1.5,2,0.5];
+  var cur=rates.indexOf(parseFloat(btn.dataset.rate));
+  var next=rates[(cur+1)%rates.length];
+  v.playbackRate=next;
+  btn.dataset.rate=next;
+  btn.textContent=next+'x';
+}
+// 循环播放
+function vLoop(btn){
+  var v=btn.closest('.video-wrap').querySelector('video');
+  v.loop=!v.loop;
+  btn.style.opacity=v.loop?'1':'0.5';
+}
+// 画中画
+async function vPiP(btn){
+  var v=btn.closest('.video-wrap').querySelector('video');
+  try{
+    if(document.pictureInPictureElement){
+      await document.exitPictureInPicture();
+    }else{
+      await v.requestPictureInPicture();
+    }
+  }catch(e){}
+}
+// 双击全屏（单击交给原生 controls，避免抢事件导致「点播放→立刻暂停」）
+document.querySelectorAll('.video-wrap video').forEach(function(v){
+  v.addEventListener('dblclick',function(e){
+    e.preventDefault();
+    if(document.fullscreenElement){
+      document.exitFullscreen();
+    }else{
+      v.requestFullscreen().catch(function(){});
+    }
+  });
+  // 记忆播放进度（localStorage）
+  var pid=v.dataset.pid;
+  var key='vp_'+pid;
+  var saved=localStorage.getItem(key);
+  if(saved&&parseFloat(saved)>2){
+    v.currentTime=parseFloat(saved);
+  }
+  v.addEventListener('timeupdate',function(){
+    localStorage.setItem(key,v.currentTime.toFixed(1));
+  });
+  // 播完清进度
+  v.addEventListener('ended',function(){
+    localStorage.removeItem(key);
+  });
+});
+
+/* ── Live Photo 长按预览（仿小红书：长按图片→播放动效→松手停止）── */
+(function(){
+  var liveItems=document.querySelectorAll('.grid-item.has-live');
+  if(!liveItems.length) return;
+  // 预加载每个 live 视频
+  var videoCache={};
+  liveItems.forEach(function(item){
+    var src=item.dataset.live;
+    if(!src) return;
+    var v=document.createElement('video');
+    v.src=src;
+    v.preload='auto';
+    v.playsInline=true;
+    v.loop=true;
+    v.muted=true;
+    v.style.cssText='position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .15s ease;border-radius:12px';
+    item.style.position='relative';
+    item.appendChild(v);
+    videoCache[src]=v;
+  });
+
+  // 长按触发（移动端 touchstart，桌面端 mousedown）
+  var timers={};
+  function startPlay(item){
+    var src=item.dataset.live;
+    var v=videoCache[src];
+    if(!v) return;
+    var img=item.querySelector('img');
+    // 淡出图片，淡入视频
+    if(img) img.style.opacity='0';
+    v.style.opacity='1';
+    v.currentTime=0;
+    v.play().catch(function(){});
+    item.classList.add('playing');
+  }
+  function stopPlay(item){
+    var src=item.dataset.live;
+    var v=videoCache[src];
+    if(!v) return;
+    var img=item.querySelector('img');
+    v.pause();
+    v.style.opacity='0';
+    if(img) img.style.opacity='1';
+    item.classList.remove('playing');
+  }
+
+  liveItems.forEach(function(item){
+    // 移动端：长按
+    item.addEventListener('touchstart',function(e){
+      timers[item]=setTimeout(function(){startPlay(item)},150);
+    },{passive:true});
+    item.addEventListener('touchend',function(e){
+      if(timers[item]){clearTimeout(timers[item]);delete timers[item];}
+      stopPlay(item);
+    },{passive:true});
+    item.addEventListener('touchmove',function(e){
+      if(timers[item]){clearTimeout(timers[item]);delete timers[item];}
+      stopPlay(item);
+    },{passive:true});
+    // 桌面端：鼠标按下
+    item.addEventListener('mousedown',function(e){
+      timers[item+'m']=setTimeout(function(){startPlay(item)},150);
+    });
+    item.addEventListener('mouseup',function(e){
+      if(timers[item+'m']){clearTimeout(timers[item+'m']);delete timers[item+'m'];}
+      stopPlay(item);
+    });
+    item.addEventListener('mouseleave',function(e){
+      if(timers[item+'m']){clearTimeout(timers[item+'m']);delete timers[item+'m'];}
+      stopPlay(item);
+    });
+    // 阻止长按后的上下文菜单（移动端）
+    item.addEventListener('contextmenu',function(e){
+      if(item.classList.contains('playing'))e.preventDefault();
+    });
+  });
+})();
+
+/* ── 快捷指令：存到相册为 Live Photo（备用，需一次性安装）── */
+function saveLivePhotos(itemId){
+  var apiUrl=location.origin+'/api/live-photo/'+itemId;
+  var hint=document.getElementById('liveHint');
+  var url='shortcuts://run-shortcut?name='+encodeURIComponent('拾光集LivePhoto')+'&input=text&text='+encodeURIComponent(apiUrl);
+  var iframe=document.createElement('iframe');
+  iframe.style.display='none';
+  iframe.src=url;
+  document.body.appendChild(iframe);
+  setTimeout(function(){document.body.removeChild(iframe);},2000);
+  if(hint){
+    hint.style.display='block';
+    hint.innerHTML='已尝试打开快捷指令。没弹出？需先安装「拾光集LivePhoto」快捷指令 — <a href="javascript:void(0)" onclick="showShortcutHelp()">查看教程</a>';
+  }
+}
+function showShortcutHelp(){
+  var h=document.getElementById('liveHint');
+  h.style.display='block';
+  h.innerHTML='<b>安装步骤（一次性）：</b><br>1. 打开「快捷指令」app → 新建<br>2. 命名「拾光集LivePhoto」（必须完全一致）<br>3. 添加 action「获取 URL 内容」=输入<br>4. 「获取字典值」Key=live_photos<br>5. 「重复」遍历，循环内：下载 image+video →「从照片创建 Live Photo」→「存储到相册」<br>6. 保存。之后点「存到相册」即可自动触发。';
+}
+</script>
+{% endblock %}

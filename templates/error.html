@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} - 拾光集{% endblock %}
+{% block content %}
+<div class="error-page">
+  <div class="error-code">{{ code }}</div>
+  <div class="error-msg">{{ message }}</div>
+  <a href="/" style="display:inline-block;color:#fff;text-decoration:none;padding:10px 28px;border-radius:22px;background:var(--accent-grad);font-weight:500;transition:transform .15s ease">← 回首页</a>
+</div>
+{% endblock %}

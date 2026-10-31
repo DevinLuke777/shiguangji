@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}拾光集{% endblock %}
+{% block content %}
+<div class="topbar">
+  <div class="hrow">
+    <a class="brand" href="/" title="回首页">
+      <img class="logo" src="/static/logo.png?v=2" alt="拾光集">
+      <span class="brand-name">拾光集</span>
+    </a>
+    <button type="button" class="sbtn" id="sOpen" onclick="openSearch()" {% if q %}style="display:none"{% endif %} aria-label="搜索">🔍</button>
+  </div>
+  <form method="post" action="/add" class="search-row" style="margin-bottom:8px">
+    <input type="text" name="links" placeholder="粘贴抖音/小红书/微博/X/TikTok 链接或主页（自动批量入库）" {% if request.args.get('msg')=='added' %}style="border-color:#30d158"{% endif %}>
+    <button type="submit" style="padding:8px 16px;border:none;border-radius:20px;background:var(--accent);color:#fff;font-size:14px;white-space:nowrap;transition:transform .1s ease">入库</button>
+  </form>
+  {% if request.args.get('msg') == 'added' %}
+  <div style="color:#30d158;font-size:12px;margin:-4px 2px 8px">✅ 已加入队列，处理中请稍候到「📥 队列」查看</div>
+  {% elif request.args.get('msg') == 'no_link' %}
+  <div style="color:#ff9f0a;font-size:12px;margin:-4px 2px 8px">没有识别到有效链接</div>
+  {% endif %}
+  <div class="search-bar" id="sBox" style="display:{% if q %}flex{% else %}none{% endif %}">
+    <form class="search-row" method="get" style="flex:1;min-width:0">
+      <input type="search" name="q" id="sInput" placeholder="搜索标题/作者/内容…" value="{{ q }}" style="-webkit-appearance:none;appearance:none">
+      <a class="scancel" href="/">取消</a>
+    </form>
+  </div>
+  <div class="filter-row">
+    <span class="chip {% if not platform %}active{% endif %}" onclick="location.href='{{ url_no_plat }}'">全部</span>
+    {% for p in platforms %}
+    <span class="chip {% if platform==p %}active{% endif %}" onclick="location.href='/?platform={{ p|urlencode }}{% if q %}&q={{ q|urlencode }}{% endif %}{% if sort %}&sort={{ sort }}{% endif %}'">{{ '推特' if p == 'X' else p }}</span>
+    {% endfor %}
+    <span class="seg">
+      <a class="seg-btn {% if sort=='created' %}on{% endif %}" href="{{ url_created }}">最新采集</a>
+      <a class="seg-btn {% if sort=='posted' %}on{% endif %}" href="{{ url_posted }}">最新发布</a>
+    </span>
+  </div>
+</div>
+
+<div class="stat-bar">共 {{ total }} 条收藏{% if author %} · 作者: {{ author }}{% endif %}{% if total > per_page %} · 第 {{ page }}/{{ total_pages }} 页{% endif %}</div>
+
+{% if not items %}
+<div class="no-result"><span class="ic">🗂️</span>没有找到内容<span class="tip">{% if q %}换个关键词试试{% else %}在顶部粘贴链接，收藏第一条内容吧{% endif %}</span></div>
+{% endif %}
+
+{% if mode == 'manage' %}
+<form method="post" action="/delete-batch" id="batchForm" onsubmit="return confirm('确定删除选中的收藏？本地文件也会一并删除！')" style="width:100%;margin:0;padding:0">
+{% endif %}
+<div class="masonry" {% if mode == 'manage' %}style="padding-bottom:88px"{% endif %}>
+{% for col in columns %}
+<div class="col">
+{% for it in col %}
+{% if mode == 'manage' %}
+<div style="position:relative;width:100%" data-idx="{{ it['idx'] }}">
+  <input type="checkbox" name="ids" value="{{ it['id'] }}" style="position:absolute;top:8px;right:8px;z-index:5;width:20px;height:20px;accent-color:var(--accent)">
+{% endif %}
+<a class="card" href="/item/{{ it['id'] }}" {% if mode != 'manage' %}data-idx="{{ it['idx'] }}"{% endif %}>
+  <div class="cover">
+    {% if it['cover_path'] %}
+    <img src="{{ url_for('media', relpath=it['cover_path']) }}" {% if it['idx'] < 12 %}loading="eager" fetchpriority="high"{% else %}loading="lazy"{% endif %}>
+    {% else %}
+    <div class="empty">{{ '🎬' if it['media_type'] == 'video' else '🖼️' }}</div>
+    {% endif %}
+    <span class="tag t-{{ it['platform'] }}">{{ '推特' if it['platform'] == 'X' else it['platform'] }}</span>
+    {% if it['media_type'] == 'video' %}<span class="play">▶</span>{% endif %}
+  </div>
+  <div class="info">
+    <img class="av" src="/avatar/{{ it['id'] }}" onerror="this.classList.add('hide')">
+    <span class="who">{{ it['title'] or '无标题' }}</span>
+    <span class="when">{{ it['created_at'][:10] if it['created_at'] else '' }}</span>
+  </div>
+</a>
+{% if mode == 'manage' %}
+</div>
+{% endif %}
+{% endfor %}
+</div>
+{% endfor %}
+{% if mode == 'manage' %}
+</div>
+<div class="mgbar" style="position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:95;display:flex;align-items:center;background:var(--bar-bg);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border:1px solid var(--bar-line);border-radius:26px;box-shadow:var(--shadow-lg);padding:5px;gap:2px">
+  <label style="font-size:13px;color:var(--sub);display:flex;align-items:center;gap:5px;padding:6px 10px;user-select:none"><input type="checkbox" id="selAll" style="width:16px;height:16px;accent-color:var(--accent)"> 全选</label>
+  <button type="submit" id="delBtn" style="background:var(--danger);color:#fff;border:none;padding:8px 18px;border-radius:18px;font-size:13px;cursor:pointer;transition:transform .1s ease;user-select:none">删除选中</button>
+  <a href="/" style="font-size:13px;color:var(--accent);text-decoration:none;padding:8px 14px;border-radius:18px;user-select:none">✕ 退出</a>
+</div>
+</form>
+{% else %}
+</div>
+{% endif %}
+
+{% if total_pages > 1 %}
+<div class="pagination">
+  {% if page > 1 %}<a href="{{ url_prev }}">← 上一页</a>{% endif %}
+  <span class="cur">{{ page }} / {{ total_pages }}</span>
+  {% if page < total_pages %}<a href="{{ url_next }}">下一页 →</a>{% endif %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+  function relayout(){
+    var wrap=document.querySelector('.masonry'); if(!wrap) return;
+    var w=window.innerWidth;
+    var n = w>=1800 ? 6 : (w>=1400 ? 5 : (w>=1100 ? 4 : (w>=768 ? 3 : 2)));
+    if(wrap.dataset.cols===String(n)) return;
+    wrap.dataset.cols=n;
+    var cards=[].slice.call(wrap.querySelectorAll(':scope > .col > [data-idx]'));
+    if(!cards.length) return;
+    cards.sort(function(a,b){return (+a.getAttribute('data-idx'))-(+b.getAttribute('data-idx'));});
+    var cols=[]; for(var i=0;i<n;i++){var d=document.createElement('div');d.className='col';cols.push(d);}
+    cards.forEach(function(c,k){cols[k%n].appendChild(c);});
+    wrap.innerHTML=''; cols.forEach(function(c){wrap.appendChild(c);});
+  }
+  var t;
+  window.addEventListener('resize',function(){clearTimeout(t);t=setTimeout(relayout,150);});
+  if(document.readyState!=='loading'){relayout();}
+  else{document.addEventListener('DOMContentLoaded',relayout);}
+})();
+function openSearch(){
+  var b=document.getElementById('sBox'); if(!b) return;
+  b.style.display='flex';
+  var o=document.getElementById('sOpen'); if(o) o.style.display='none';
+  var i=document.getElementById('sInput'); if(i) i.focus();
+}
+(function(){
+  var tb=document.querySelector('.topbar');
+  if(!tb||!('IntersectionObserver' in window)) return;
+  var mark=document.createElement('div');
+  mark.style.cssText='position:absolute;top:0;left:0;width:1px;height:1px;pointer-events:none';
+  document.body.appendChild(mark);
+  new IntersectionObserver(function(en){tb.classList.toggle('is-scrolled',!en[0].isIntersecting);},{threshold:0}).observe(mark);
+})();
+{% if mode != 'manage' %}
+(function(){
+  var sy=0,on=false;
+  document.addEventListener('touchstart',function(e){if(window.scrollY<=0){sy=e.touches[0].clientY;on=true;}},{passive:true});
+  document.addEventListener('touchmove',function(e){if(on&&window.scrollY<=0&&e.touches[0].clientY-sy>90){on=false;location.reload();}},{passive:true});
+  document.addEventListener('touchend',function(){on=false;},{passive:true});
+})();
+{% endif %}
+{% if mode == 'manage' %}
+document.getElementById('selAll').onchange=function(){var b=this.checked;document.querySelectorAll('input[name=ids]').forEach(function(c){c.checked=b});updDel()};
+function updDel(){var n=document.querySelectorAll('input[name=ids]:checked').length;var d=document.getElementById('delBtn');d.textContent=n?('删除选中('+n+')'):'删除选中'}
+document.querySelectorAll('input[name=ids]').forEach(function(c){c.addEventListener('change',updDel)});
+{% endif %}
+
+/* 图片加载完成淡入 + 失败兜底 */
+document.querySelectorAll('.cover img').forEach(function(img){
+  if(img.complete&&img.naturalWidth>0){img.classList.add('loaded');return;}
+  img.addEventListener('load',function(){img.classList.add('loaded')});
+  img.addEventListener('error',function(){
+    img.style.display='none';
+    var p=img.parentElement;
+    if(!p.querySelector('.empty')){
+      var e=document.createElement('div');e.className='empty';e.textContent='🖼️';p.appendChild(e);
+    }
+  });
+});
+
+/* 返回顶部按钮 */
+(function(){
+  var btn=document.createElement('div');
+  btn.id='toTop';
+  btn.textContent='↑';
+  btn.style.cssText='position:fixed;right:20px;bottom:88px;width:40px;height:40px;border-radius:50%;background:var(--bar-bg);backdrop-filter:blur(20px);border:1px solid var(--bar-line);box-shadow:var(--shadow-lg);display:none;align-items:center;justify-content:center;font-size:20px;color:var(--accent);cursor:pointer;z-index:85;transition:opacity .2s';
+  document.body.appendChild(btn);
+  window.addEventListener('scroll',function(){btn.style.display=window.scrollY>600?'flex':'none'},{passive:true});
+  btn.addEventListener('click',function(){window.scrollTo({top:0,behavior:'smooth'})});
+})();
+</script>
+{% endblock %}

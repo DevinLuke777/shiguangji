@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}统计 - 拾光集{% endblock %}
+{% block content %}
+<div style="max-width:760px;margin:0 auto;padding:20px">
+  <a class="back" href="/">← 返回列表</a>
+  <h1 style="font-size:22px;font-weight:700;margin-bottom:8px;letter-spacing:-.02em">📊 拾光集统计</h1>
+  <div style="font-size:14px;color:var(--sub);margin-bottom:20px">共 <strong style="color:var(--text);font-size:18px">{{ total }}</strong> 条收藏</div>
+
+  <div style="background:var(--card);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow-md)">
+    <h2 style="font-size:15px;font-weight:600;margin-bottom:16px;color:var(--sub)">🌐 平台分布</h2>
+    {% for p in platforms %}
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <span style="width:70px;font-size:13px;font-weight:500;color:var(--text);flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p['platform'] }}</span>
+      <div style="flex:1;height:24px;background:var(--fill);border-radius:8px;overflow:hidden">
+        <div class="bar-stat" style="width:{{ (p['c'] / max_p * 100)|int }}%"></div>
+      </div>
+      <span style="font-size:13px;font-weight:600;color:var(--sub);flex-shrink:0;min-width:32px;text-align:right;font-variant-numeric:tabular-nums">{{ p['c'] }}</span>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div style="background:var(--card);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow-md)">
+    <h2 style="font-size:15px;font-weight:600;margin-bottom:16px;color:var(--sub)">👤 作者 Top 10</h2>
+    {% for a in authors %}
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <span style="width:90px;font-size:13px;font-weight:500;color:var(--text);flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="/?author={{ a['author_name']|urlencode }}" style="color:var(--accent);text-decoration:none">{{ a['author_name'] }}</a></span>
+      <div style="flex:1;height:24px;background:var(--fill);border-radius:8px;overflow:hidden">
+        <div class="bar-stat" style="width:{{ (a['c'] / max_a * 100)|int }}%"></div>
+      </div>
+      <span style="font-size:13px;font-weight:600;color:var(--sub);flex-shrink:0;min-width:32px;text-align:right;font-variant-numeric:tabular-nums">{{ a['c'] }}</span>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div style="background:var(--card);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow-md)">
+    <h2 style="font-size:15px;font-weight:600;margin-bottom:16px;color:var(--sub)">📈 收藏趋势（近 {{ trend|length }} 天）</h2>
+    {% if trend %}
+    <div style="display:flex;align-items:flex-end;gap:5px;height:140px;padding-top:10px">
+      {% set max_t = trend|map(attribute='c')|max %}
+      {% for t in trend %}
+      <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%;justify-content:flex-end;cursor:pointer" title="{{ t['d'] }}: {{ t['c'] }} 条">
+        <div style="width:75%;background:var(--accent-grad);border-radius:4px 4px 0 0;min-height:3px;height:{{ (t['c'] / max_t * 100)|int }}%;transition:height .4s ease"></div>
+        <span style="font-size:9px;color:var(--fill2);writing-mode:vertical-rl;transform:rotate(180deg);max-height:36px;overflow:hidden">{{ t['d'][5:] }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div style="color:var(--fill2);font-size:13px">暂无数据</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

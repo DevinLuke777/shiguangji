@@ -15,7 +15,8 @@
 - 🎬 视频内联播放、图片网格 + **Lightbox 灯箱**
 - 👤 作者头像本地代理（防外链打乱布局）
 - 🖼️ 自动缩略图（视频抽帧/图片缩放）
-- 📥 **网页粘贴链接自动入库**：顶部输入框粘抖音/小红书链接 → 后台队列自动下载归档入库（详见 `download_worker.py`），零手动干预
+- 📥 **网页粘贴链接自动入库**：顶部输入框粘抖音/小红书/微博/X/TikTok 链接 → 后台队列自动下载归档入库（详见 `download_worker.py`），零手动干预
+- 🏠 **主页批量入库**：粘贴主页链接（如 `tiktok.com/@user`、`weibo.com/u/123`、`xiaohongshu.com/user/profile/xxx`）→ 自动展开最新 20 条 → 逐条下载归档，已收藏自动跳过
 
 ## 📦 快速部署（Docker）
 
@@ -39,9 +40,23 @@ docker compose up -d --build
 ## 🔧 手动部署（不用 Docker）
 
 ```bash
-pip install flask
+pip install -r requirements.txt
 python3 init_db.py          # 建库（Docker 方式会自动建，可跳过）
 MEDIA_ROOT=/path/to/media python3 app.py   # 启动 Web
+```
+
+### 生产部署（推荐 gunicorn）
+
+```bash
+pip install gunicorn
+gunicorn -w 4 -b 0.0.0.0:8090 app:app --timeout 120
+```
+
+### 数据库备份（建议 cron）
+
+```bash
+# 每天凌晨备份 SQLite（用 .backup 命令保证一致性）
+0 3 * * * sqlite3 /data/media_library.db ".backup '/backup/shiguangji_$(date +\%Y\%m\%d).db'"
 ```
 
 ## ✅ 部署前须知（两条路，选你要的）
@@ -84,15 +99,29 @@ python3 gen_thumbs.py
 
 ## 🧠 元数据采集
 
-| 平台 | 元数据源 | 媒体下载 |
-|------|---------|---------|
-| 小红书 | 页面 JSON（title/nickName/avatar/time）| 视频=309 流无水印；图文=ci.xiaohongshu.com 无水印通道 |
-| 抖音 | 轻解析 API（需自建轻解析服务）| 轻解析 |
-| 微博 | m.weibo.cn API | original 原图 + live 图 |
-| TikTok | tikwm API | tikwm |
-| X/推特 | yt-dlp | yt-dlp |
+| 平台 | 元数据源 | 媒体下载 | Live 图 |
+|------|---------|---------|---------|
+| 小红书 | 页面 JSON（title/nickName/avatar/time）| 视频=309 流无水印；图文=XHS-Downloader 无水印原图 | ✅ livePhoto 配对，转 iPhone Live Photo |
+| 抖音 | 轻解析 API（需自建轻解析服务）| 轻解析 | — |
+| 微博 | m.weibo.cn API | original 原图 | ✅ live_photo_url 配对，转 iPhone Live Photo |
+| TikTok | tikwm API | tikwm 无水印 play | — |
+| X/推特 | fxtwitter API | fxtwitter + 代理下载 | — |
 
 > 采集脚本是通用参考实现，各平台反爬策略变化快，可能需要按当时情况调整。
+
+### 📱 iPhone Live Photo 支持
+
+小红书/微博的 Live 图下载后会自动转成 **iPhone Live Photo 格式**：
+
+1. **mp4 → mov** 转换（ffmpeg，H.264 copy 不重新编码）
+2. **图片和视频同名**（如 `title_1.jpg` + `title_1.mov`）
+3. **注入 Apple 元数据**（exiftool）：
+   - JPG 写入 `MakerApple65` (MediaGroupUUID)
+   - MOV 写入 `ContentIdentifier`（和 JPG 的 UUID 一致）
+4. AirDrop 或 iCloud 导入 iPhone 后，相册自动识别为 Live Photo
+
+**依赖**：`ffmpeg` + `exiftool`（Docker 镜像已含，手动部署需 `apt install exiftool`）。
+exiftool 不可用时降级为只保证同名配对（可用 iOS 快捷指令手动配对）。
 
 ## ⚠️ 踩坑记录
 

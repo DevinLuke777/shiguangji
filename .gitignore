@@ -1,10 +1,24 @@
 # 数据库与私人数据（绝不提交）
 *.db
 avatars/
+
+# Python 缓存
 __pycache__/
 *.pyc
+*.pyo
+
+# 日志
+logs/
+*.log
 
 # 本地运行产生的文件
 .venv/
 .env
 .DS_Store
+
+# 队列文件
+_queue.json
+_queue.lock
+
+# Docker 持久化数据
+shiguangji-data/

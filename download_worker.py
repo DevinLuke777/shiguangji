@@ -1,74 +1,59 @@
 #!/usr/bin/env python3
 """
-拾光集 · 后台自动入库队列 worker（2026-08-18）
-从 拾光集/_queue.json 读取 pending 链接，自动:
-  抖音    -> 轻解析(8086, cookie已配) 解析下载 -> 归档 -> ingest
-  小红书视频 -> 短链展开 -> 挖 258 无水印流 -> 下载 -> 归档 -> ingest
+拾光集 · 后台自动入库队列 worker（模块化重构版）
+从 _queue.json 读取 pending 链接，自动:
+  抖音    -> 轻解析(8086) 解析下载 -> 归档 -> ingest
+  小红书视频 -> 短链展开 -> 挖 309/258 无水印流 -> 下载 -> 归档 -> ingest
   小红书图文 -> XHS-Downloader + cookie 下无水印原图 -> 归档 -> ingest
                (token 过期则降级 sns-webpic 带水印渲染图并标记 degraded)
 用法: python3 download_worker.py --drain    # 处理一次队列里所有 pending
-用系统/Hermes cron 每 2 分钟调用一次; stdout 为空=静默(成功不打扰)。
+用 cron 每 2 分钟调用一次。
 """
-import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.parse, shutil, glob, sqlite3
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
+from typing import List
 
-MEDIA = os.environ.get("MEDIA_ROOT", "/vol1/1000/Downloads/拾光集")   # 换成你的媒体根目录
-QUEUE = os.environ.get("QUEUE_FILE", os.path.join(MEDIA, "_queue.json"))
-LOCK = os.path.join(MEDIA, "_queue.lock")
-VALT = os.environ.get("INGEST_DIR", "/vol1/1000/Docker/shiguangji")  # ingest.py 所在(运行实例)
-INGEST = os.path.join(VALT, "ingest.py")
-# 路径迁移：原飞牛 Hermes 已弃用，改用本地 Hermes venv
-PY = os.environ.get("WORKER_PYTHON", "/home/16675244747/.hermes/hermes-agent/venv/bin/python3")
-XHS_VENV = os.environ.get("XHS_PYTHON", "/home/16675244747/.hermes/workspace/xhs-downloader/.venv/bin/python")  # XHS-Downloader 独立 venv
+from config import (
+    MEDIA_ROOT, QUEUE_FILE, QUEUE_LOCK, INGEST_SCRIPT,
+    WORKER_PYTHON, XHS_PYTHON, XHS_DIR, XHS_COOKIE_FILE,
+    LITE_PARSER_URL, PROXY_URL, UA_MOBILE, UA_DESKTOP, BARK_URL,
+)
+from queue_manager import load_queue, save_queue
+from utils import clean_title, sanitize_filename, gen_thumb_ffmpeg, pick_stream, parse_xhs_meta
+from logger import log
 
-UA_I = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-UA_D = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+MEDIA = MEDIA_ROOT
+SRC_TAG = ""   # 当前任务的素材来源标签（309/258=无水印流 259=水印流 orig=原图 render=带水印渲染 wm=带水印 ok=干净）
+QUEUE = QUEUE_FILE
+LOCK = QUEUE_LOCK
+INGEST = INGEST_SCRIPT
+PY = WORKER_PYTHON
+XHS_VENV = XHS_PYTHON
 
+UA_I = UA_MOBILE
+UA_D = UA_DESKTOP
 
-# ── 队列读写 ──────────────────────────────────────────
-def load_queue():
-    if not os.path.isfile(QUEUE):
-        return []
-    try:
-        with open(QUEUE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
-
-
-def save_queue(q):
-    tmp = QUEUE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(q, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, QUEUE)
-
-
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走代理
-WARN = []  # 本次下载的警告(如水印兜底)，由 process_one 写进队列消息
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+WARN = []
 
 
 def fetch(url, timeout=20, referer=None):
+    """HTTP 请求（不走代理）"""
     headers = {"User-Agent": UA_I}
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    # 直连：本机服务(localhost:8086 轻解析)若走 http_proxy 会被 sing-box 劫持报 502 Bad Gateway
     return _OPENER.open(req, timeout=timeout).read()
-
-
-def clean_title(t):
-    t = (t or "").strip()
-    while t and not re.match(r"[\u4e00-\u9fffA-Za-z0-9]", t[0]):
-        t = t[1:]
-    # 去换行符（0x0a/0x0d -> 空格），否则目录名带换行 Flask URL 404
-    t = re.sub(r'[\n\r]+', ' ', t).strip()
-    # 去掉末尾 #话题标签（小红书常见）
-    t = re.sub(r'(\s*#\S+\s*)+$', '', t).strip()
-    # 截断过长标题（目录名限制）
-    if len(t) > 80:
-        t = t[:80].rstrip()
-    return t
 
 
 def today():
@@ -76,30 +61,19 @@ def today():
 
 
 def gen_thumb(d, title, is_video):
-    """生成 _thumb.jpg"""
-    try:
-        src = os.path.join(d, f"{title}.mp4") if is_video else os.path.join(d, f"{title}_1.png")
-        if not os.path.isfile(src):
-            # 图文可能用 jpg; 图片多命名时兜底
-            cands = sorted(glob.glob(os.path.join(d, "*.png")) + glob.glob(os.path.join(d, "*.jpg")) + glob.glob(os.path.join(d, f"{title}_1.jpeg")))
-            if not cands:
-                return
-            src = cands[0]
-        cmd = ["ffmpeg", "-y"] + (["-ss", "0.5"] if is_video else []) + \
-            ["-i", src, "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", os.path.join(d, "_thumb.jpg")]
-        subprocess.run(cmd, capture_output=True, timeout=60)
-    except Exception:
-        pass
+    """生成 _thumb.jpg：定位源文件（video 找 {title}.mp4，image 找第一张图）后调 ffmpeg"""
+    src = os.path.join(d, f"{title}.mp4") if is_video else os.path.join(d, f"{title}_1.png")
+    if not os.path.isfile(src):
+        cands = sorted(glob.glob(os.path.join(d, "*.png")) + glob.glob(os.path.join(d, "*.jpg")))
+        if not cands:
+            return
+        src = cands[0]
+    gen_thumb_ffmpeg(src, os.path.join(d, "_thumb.jpg"), is_image=not is_video)
 
 
 # ── 抖音 ──────────────────────────────────────────────
 def download_douyin(url):
-    """轻解析解析+下载，返回 (relative_path, title, platform, author)。
-    三重串号防护:
-      1) 调轻解析前清掉抖音目录下已存在的旧 untitled 残留(轻解析复用同名 untitled 是串号根源)
-      2) 用时间戳快照只认"本次触发后新出现"的落盘目录
-      3) 认领后立即把 untitled 改名到标题目录(切断下次复用污染)"""
-    # 展开短链
+    """轻解析解析+下载，返回 (relative_path, title, platform, author)"""
     real = url
     m = re.search(r"v\.douyin\.com/([A-Za-z0-9_-]+)/", url)
     if not m and re.search(r"douyin\.com", url):
@@ -115,27 +89,23 @@ def download_douyin(url):
                 real = url
     base = os.path.join(MEDIA, "抖音", today())
     os.makedirs(base, exist_ok=True)
-    # 防护1: 清掉已存在的旧 untitled 残留（防止轻解析复用同名目录污染本次下载）
     old_untitled = os.path.join(base, "untitled")
     if os.path.isdir(old_untitled):
         try:
             shutil.rmtree(old_untitled)
         except Exception:
             pass
-    # 防护2: 调轻解析前记录目录快照
     pre_names = set(os.listdir(base))
     started = time.time()
-    # 调轻解析
     enc = urllib.parse.quote(real, safe="")
-    api = f"http://localhost:8086/video/share/url/parse?url={enc}"
+    api = f"{LITE_PARSER_URL}/video/share/url/parse?url={enc}"
     d = json.loads(fetch(api, timeout=40).decode("utf-8", "ignore"))
     if d.get("code") != 200:
         raise RuntimeError(f"轻解析失败: {d.get('msg','?')}")
     data = d.get("data") or {}
     author = (data.get("author") or {}).get("name") or "未知作者"
     title = clean_title(data.get("title")) or author
-    # 等落盘: 只认"本次新出现"的目录（快照外的），或**解析后被刷新的既有同名目录**
-    #（轻解析复用同名目录时不会出现在 new 里 → 只认 new 会误报「等待抖音落盘超时」）
+
     def newest_mtime(p):
         try:
             return max((os.path.getmtime(os.path.join(p, f)) for f in os.listdir(p)), default=0)
@@ -162,25 +132,20 @@ def download_douyin(url):
         time.sleep(5)
         waited += 5
     if not found:
-        # 兜底：新的 untitled（本次新建的）
         if os.path.isdir(old_untitled):
             files = [f for f in os.listdir(old_untitled)]
             if any(f.lower().endswith((".mp4", ".mov", ".jpg", ".jpeg", ".png")) for f in files):
                 found = old_untitled
     if not found:
         raise RuntimeError("等待抖音落盘超时")
-    # 防护3: 归档到 抖音/日期/标题/。
-    # 关键修复: 标题目录若已存在(多条不同视频可能同名, 如空标题都用作者名),
-    #   **绝不删除**——追加唯一后缀(_2/_3)并存，避免覆盖/删掉别人的内容
-    base_dir = "".join(c for c in title if c not in ':：/\\*?"<>|')[:60] or f"抖音_{int(time.time())}"
+
+    base_dir = sanitize_filename(title) or f"抖音_{int(time.time())}"
     target = os.path.join(base, base_dir)
     suffix = 2
     while os.path.isdir(target):
         target = os.path.join(base, f"{base_dir}_{suffix}")
         suffix += 1
     os.makedirs(target, exist_ok=True)
-    # ★核心修复: final_dir = 实际创建的目录名(可能带 _2/_3 后缀)。
-    #   rel(入库path) 和 文件名前缀 都必须用它，与下载目录严格一致
     final_dir = os.path.basename(target)
     moved_video = False
     for f in list(os.listdir(found)):
@@ -208,7 +173,6 @@ def download_douyin(url):
             os.remove(src)
         else:
             shutil.move(src, os.path.join(target, f))
-    # 清空源目录
     if os.path.isdir(found) and os.listdir(found) == []:
         try:
             os.rmdir(found)
@@ -216,7 +180,6 @@ def download_douyin(url):
             pass
     rel = os.path.join("抖音", today(), final_dir)
     d = os.path.join(MEDIA, rel)
-    # 判断图文: 有图片且无视频(true video 帖会 moved_video)
     is_图文 = (not moved_video) and any(f.lower().endswith((".jpg", ".jpeg", ".png")) for f in os.listdir(d))
     gen_thumb(d, final_dir, is_video=not is_图文)
     return rel, title, "抖音", author
@@ -224,19 +187,17 @@ def download_douyin(url):
 
 # ── 小红书 ─────────────────────────────────────────────
 def xhs_expand(url):
-    """展开 xhslink 短链，返回 (real_url, note_id, xsec_token, type)"""
+    """展开 xhslink 短链"""
     r = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15)
     real = r.geturl()
     m = re.search(r"/discovery/item/([a-f0-9]{24})", real)
     if not m:
         raise RuntimeError("小红书短链展开失败")
     nid = m.group(1)
-    # token 在展开后的 real URL 里(xhslink短链本身不含)，其次才可能从原url带
     tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real)
     if not tok:
         tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", url or "")
     tok = tok.group(1) if tok else None
-    # type 从 real URL 的 type=video / type=normal
     typ = "normal"
     tm = re.search(r"type=(\w+)", real)
     if tm:
@@ -245,14 +206,13 @@ def xhs_expand(url):
 
 
 def xhs_get_page(real_url, nid, tok):
-    """抓页面。实测(2026-08-18): 带 cookie 反而触发反爬返回 ~10KB JS 壳，
-    不带 cookie + token + 桌面UA 成功(861KB 含 masterUrl)。token 失效时返回空壳→抛错。
-    2026-09-14 补：先不带 cookie 试，失败再带 cookie（cookie 通道可救部分 token 过期页）。"""
+    """抓小红书页面"""
     url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
     if tok:
         url += f"?xsec_source=app_share&xsec_token={tok}="
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
-    cookie = open(cookie_file, encoding="utf-8").read().strip() if os.path.isfile(cookie_file) else ""
+    cookie = ""
+    if XHS_COOKIE_FILE and os.path.isfile(XHS_COOKIE_FILE):
+        cookie = open(XHS_COOKIE_FILE, encoding="utf-8").read().strip()
     passes = [(UA_D, ""), (UA_I, "")]
     if cookie:
         passes += [(UA_I, cookie), (UA_D, cookie)]
@@ -270,25 +230,9 @@ def xhs_get_page(real_url, nid, tok):
     raise RuntimeError("小红书页面抓取失败(可能是 xsec_token 过期,需在App重新分享该链接)")
 
 
-def xhs_pick_stream(html):
-    """挑无水印流：优先 309(X265) → 258(X264) → 兜底第一个 masterUrl(通常 259 带水印)。
-    返回 (url, tag)。259 流带作者头像+小红书 logo 水印，309/258 是干净原流(2026-09-14 实锤：
-    本地字节数 == 页面 259 流 Content-Length 完全一致)。"""
-    for tag in ("309", "258"):
-        m = re.search(r'"masterUrl":"([^"]+_%s\.mp4[^"]*)"' % tag, html)
-        if m:
-            return m.group(1).replace("\\u002F", "/").replace("\\/", "/"), tag
-    m = re.search(r'"masterUrl":"([^"]+)"', html)
-    if not m:
-        return None, None
-    return m.group(1).replace("\\u002F", "/").replace("\\/", "/"), "259"
-
-
 def xhs_downloader_video(nid, real_url, title, d):
-    """用 XHS-Downloader 下视频(它走官方签名接口，稳定拿 309 无水印流)。
-    成功返回 True。"""
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
-    if not (os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV)):
+    """用 XHS-Downloader 下视频"""
+    if not (XHS_COOKIE_FILE and os.path.isfile(XHS_COOKIE_FILE) and XHS_VENV and os.path.isfile(XHS_VENV)):
         return False
     tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
     url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
@@ -297,9 +241,8 @@ def xhs_downloader_video(nid, real_url, title, d):
     work = f"/tmp/xhs_vid_{nid}"
     shutil.rmtree(work, ignore_errors=True)
     try:
-        xhs_dir = os.environ.get("XHS_DIR", "/home/16675244747/.hermes/workspace/xhs-downloader")
-        cookie = open(cookie_file, encoding="utf-8").read().strip()
-        subprocess.run([XHS_VENV, os.path.join(xhs_dir, "main.py"), "--url", url,
+        cookie = open(XHS_COOKIE_FILE, encoding="utf-8").read().strip()
+        subprocess.run([XHS_VENV, os.path.join(XHS_DIR, "main.py"), "--url", url,
                         "--cookie", cookie, "--work_path", work, "--download_record", "false"],
                        capture_output=True, timeout=240)
         mp4s = glob.glob(os.path.join(work, "Download", "**", "*.mp4"), recursive=True)
@@ -316,19 +259,20 @@ def xhs_downloader_video(nid, real_url, title, d):
 
 
 def xhs_download_video(html, nid, title, author, real_url=""):
-    """挖无水印流(309/258)下载视频；页面只有 259 时改走 XHS-Downloader。"""
-    vurl, tag = xhs_pick_stream(html)
+    """挖无水印流下载视频"""
+    global SRC_TAG
+    vurl, tag = pick_stream(html)
+    SRC_TAG = tag or ""
     if not vurl:
         raise RuntimeError("无 masterUrl")
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
     if tag == "259":
-        # 页面只给水印流 → 先试 XHS-Downloader(签名接口常能拿到 309)
         if xhs_downloader_video(nid, real_url, title, d):
             gen_thumb(d, title, is_video=True)
             return os.path.join("小红书", today(), title)
     if tag == "259":
-        WARN.append("平台只提供 259 水印流(无 309/258)，已入库但可能带水印，可在 App 重新分享后重试")
+        WARN.append("平台只提供 259 水印流(无 309/258)，已入库但可能带水印")
     data = fetch(vurl, timeout=120, referer="https://www.xiaohongshu.com/")
     with open(os.path.join(d, f"{title}.mp4"), "wb") as f:
         f.write(data)
@@ -337,28 +281,39 @@ def xhs_download_video(html, nid, title, author, real_url=""):
 
 
 def xhs_download_images(html, nid, title, author, real_url):
-    """图文: 优先 XHS-Downloader 无水印原图; 失败降级 sns-webpic 直抓"""
+    """图文: 优先 XHS-Downloader 无水印原图; 失败降级 sns-webpic 直抓。
+    Live 图: 解析页面 livePhoto 字段，配对下载 mp4（{title}_live{i}.mp4）"""
+    global SRC_TAG
+    SRC_TAG = "orig"
     d = os.path.join(MEDIA, "小红书", today(), title)
     os.makedirs(d, exist_ok=True)
-    # 尝试 XHS-Downloader(无水印原图)
-    cookie_file = os.environ.get("XHS_COOKIE_FILE", "/home/16675244747/.hermes/workspace/xhs_cookie.txt")
-    if os.path.isfile(cookie_file) and os.path.isfile(XHS_VENV):
+
+    # ── 解析 Live 图视频 URL（小红书页面 imageList 里的 livePhoto 字段）──
+    # 格式: "livePhotoUrl":"https://.../xxx.mp4" 或 "livePhoto":"..."
+    live_urls = re.findall(r'"livePhoto(?:Url)?":"([^"]+\.mp4[^"]*)"', html)
+    live_urls = [u.replace("\\u002F", "/").replace("\\/", "/") for u in live_urls]
+    # 去重保序
+    seen_live, live_picked = set(), []
+    for u in live_urls:
+        if u not in seen_live:
+            seen_live.add(u)
+            live_picked.append(u)
+
+    if XHS_COOKIE_FILE and os.path.isfile(XHS_COOKIE_FILE) and XHS_VENV and os.path.isfile(XHS_VENV):
         tok = re.search(r"xsec_token=([A-Za-z0-9_\-]+)=", real_url or "")
         url = f"https://www.xiaohongshu.com/discovery/item/{nid}"
         if tok:
             url += f"?xsec_source=app_share&xsec_token={tok.group(1)}="
-        cookie = open(cookie_file, encoding="utf-8").read().strip()
+        cookie = open(XHS_COOKIE_FILE, encoding="utf-8").read().strip()
         work = f"/tmp/xhs_worker_{nid}"
         shutil.rmtree(work, ignore_errors=True)
         try:
-            xhs_dir = os.environ.get("XHS_DIR", "/home/16675244747/.hermes/workspace/xhs-downloader")
             subprocess.run(
-                [XHS_VENV, os.path.join(xhs_dir, "main.py"),
+                [XHS_VENV, os.path.join(XHS_DIR, "main.py"),
                  "--url", url, "--cookie", cookie, "--work_path", work,
                  "--image_format", "PNG", "--download_record", "false"],
                 capture_output=True, timeout=150)
             pngs = glob.glob(os.path.join(work, "Download", "**", "*.png"), recursive=True)
-            # 递归 glob 已覆盖根目录，额外去重（同一文件被两条 glob 命中会导致每张图存两份）
             seen = set()
             uniq = []
             for x in pngs:
@@ -371,11 +326,14 @@ def xhs_download_images(html, nid, title, author, real_url):
             if pngs:
                 for i, p in enumerate(pngs, 1):
                     shutil.copy(p, os.path.join(d, f"{title}_{i}.png"))
+                # Live 图配对（XHS-Downloader 不下 live 视频，单独抓）
+                _download_xhs_live_photos(live_picked, d, title)
                 gen_thumb(d, title, is_video=False)
                 return os.path.join("小红书", today(), title)
         except Exception:
             pass
     # 降级: sns-webpic 直抓(带水印)
+    SRC_TAG = "render"
     urls = re.findall(r'https?://sns-webpic[^"\\s\\]|\\"\\'']+', html)
     urls = [u for u in urls if "h5_1080" in u or "!nd_prv" in u or "!nd_dft" in u]
     seen, picked = set(), []
@@ -384,7 +342,6 @@ def xhs_download_images(html, nid, title, author, real_url):
             seen.add(u)
             picked.append(u.replace("\\u002F", "/"))
     if not picked:
-        # 裸 http URL
         picked = re.findall(r'https?://sns-webpic-qc\.xhscdn\.com[^"\\s\\]+?h5_1080[^"\\s]*', html)
         picked = [u.replace("\\u002F", "/") for u in picked]
         seen, dedup = set(), []
@@ -403,35 +360,60 @@ def xhs_download_images(html, nid, title, author, real_url):
             pass
     if ok == 0:
         raise RuntimeError("小红书图文下载失败(无水印+水印都拿不到)")
+    # Live 图配对
+    _download_xhs_live_photos(live_picked, d, title)
     gen_thumb(d, title, is_video=False)
     return os.path.join("小红书", today(), title)
+
+
+def _download_xhs_live_photos(live_urls, d, title):
+    """下载小红书 Live 图配对视频，转成 iPhone Live Photo 格式。
+    - 下载 mp4 → 转 mov → 注入 Apple 元数据（ContentIdentifier + MediaGroupUUID）
+    - 配对图片必须已存在（{title}_{i}.png/jpg）
+    - 失败不阻塞图文入库（锦上添花）"""
+    if not live_urls:
+        return
+    from utils import make_live_photo
+    ok = 0
+    converted = 0
+    for i, u in enumerate(live_urls[:20], 1):
+        # 视频先下到临时 mp4
+        tmp_mp4 = os.path.join(d, f"{title}_live{i}.mp4")
+        try:
+            data = fetch(u, timeout=60, referer="https://www.xiaohongshu.com/")
+            if len(data) < 1000:
+                continue
+            with open(tmp_mp4, "wb") as f:
+                f.write(data)
+            ok += 1
+            # 找配对的图片（XHS-Downloader 存 png，sns-webpic 存 jpg）
+            img = None
+            for ext in (".png", ".jpg", ".jpeg"):
+                cand = os.path.join(d, f"{title}_{i}{ext}")
+                if os.path.isfile(cand):
+                    img = cand
+                    break
+            if img:
+                # 转成 iPhone Live Photo（mp4→mov + exiftool 注入元数据）
+                make_live_photo(img, tmp_mp4)
+                converted += 1
+        except Exception:
+            pass
+    if ok > 0:
+        msg = f"已下载 {ok} 个 Live 图"
+        if converted > 0:
+            msg += f"，{converted} 个已转 iPhone Live Photo 格式"
+        WARN.append(msg)
 
 
 def download_xiaohongshu(url):
     real, nid, tok, typ = xhs_expand(url)
     html, _ = xhs_get_page(real, nid, tok)
-    # 提取标题：优先 <title>（权威「笔记标题 - 小红书」），再 note JSON，最后 fallback
-    mt = re.search(r'<title>([^<]*?)</title>', html)
-    title = None
-    if mt:
-        t = mt.group(1).replace(" - 小红书", "").strip()
-        if t and t != "小红书":
-            title = t
-    if not title:
-        mn = re.search(r'"title":"([^"]*)"', html)
-        if mn and mn.group(1) and "想了解" not in mn.group(1):
-            title = mn.group(1)
-    title = clean_title(title or "小红书笔记")
-    author = "小红书用户"
-    ma = re.search(r'"nickname":"([^"]*)"', html)
-    if ma:
-        author = ma.group(1)
-    # 提取头像（解码 \u002F 转义）
-    avatar = None
-    av_m = re.search(r'"avatar":"([^"]+)"', html)
-    if av_m:
-        avatar = av_m.group(1).replace("\\u002F", "/").replace("\u002F", "/")
-    has_video = bool(re.search(r'"masterUrl":"[^"]+_(259|309|258)\.mp4', html))
+    meta = parse_xhs_meta(html)
+    title = clean_title(meta["title"] or "小红书笔记")
+    author = meta["author_name"]
+    avatar = meta["author_avatar"]
+    has_video = meta["has_video"]
     if typ == "video" or has_video or ('"masterUrl"' in html and '"imageList"' not in html):
         rel = xhs_download_video(html, nid, title, author, real_url=real)
         return rel, title, "小红书", avatar
@@ -440,30 +422,22 @@ def download_xiaohongshu(url):
         return rel, title, "小红书", avatar
 
 
-# ── 主流程 ─────────────────────────────────────────────
-
-# ── 微博 (2026-09-21, 新增自动通道) ──────────────────────────────
+# ── 微博 ──────────────────────────────────────────────
 def _wb_pid_from_url(u):
-    """从图片 URL 抽 pid: wx3.sinaimg.cn/mw2000/<pid>.jpg → pid"""
     m = re.search(r"/(?:mw2000|large|orj\d+|original)/([a-zA-Z0-9]+)\.", u)
     return m.group(1) if m else None
 
 
 def download_weibo(url):
-    """微博链接: 走轻解析拿元数据+图片+live 图+视频,
-    原图用 wx1.sinaimg.cn/original/{pid}.jpg 替换压缩图, live 图下 mov 配对.
-    返回 (relative_path, title, platform, author)."""
-    # 1) 短链展开 (weibo.com / m.weibo.cn 都接)
+    """微博链接下载"""
     real = url
     if "t.cn" in url or "/short/" in url:
-        # 短链走 _OPENER,不要走代理
         try:
             real = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15).geturl()
         except Exception:
             real = url
-    # 2) 调轻解析
     enc = urllib.parse.quote(real, safe="")
-    api = f"http://localhost:8086/video/share/url/parse?url={enc}"
+    api = f"{LITE_PARSER_URL}/video/share/url/parse?url={enc}"
     last_err = None
     d = None
     for attempt in range(2):
@@ -491,21 +465,17 @@ def download_weibo(url):
     os.makedirs(base, exist_ok=True)
 
     saved_video = False
-    # 3) 优先视频
     if video_url:
         try:
             r = _OPENER.open(urllib.request.Request(video_url, headers={
-                "User-Agent": UA_I,
-                "Referer": "https://weibo.com/",
+                "User-Agent": UA_I, "Referer": "https://weibo.com/",
             }), timeout=120)
-            data_bytes = r.read()
             with open(os.path.join(base, f"{title}.mp4"), "wb") as f:
-                f.write(data_bytes)
+                f.write(r.read())
             saved_video = True
         except Exception as e:
             WARN.append(f"微博视频下载失败: {str(e)[:80]}")
 
-    # 4) 图文帖: 下载原图 + live 图配对
     saved_n = 0
     if not saved_video and images:
         for idx, im in enumerate(images, 1):
@@ -515,71 +485,65 @@ def download_weibo(url):
             orig_url = f"https://wx1.sinaimg.cn/original/{pid}.jpg" if pid else short_url
             try:
                 r = _OPENER.open(urllib.request.Request(orig_url, headers={
-                    "User-Agent": UA_I,
-                    "Referer": "https://weibo.com/",
+                    "User-Agent": UA_I, "Referer": "https://weibo.com/",
                 }), timeout=60)
                 with open(os.path.join(base, f"{title}_{idx}.jpg"), "wb") as f:
                     f.write(r.read())
                 saved_n += 1
             except Exception:
-                # 原图失败: 退回 mw2000 压缩图
                 if short_url:
                     try:
                         r = _OPENER.open(urllib.request.Request(short_url, headers={
-                            "User-Agent": UA_I,
-                            "Referer": "https://weibo.com/",
+                            "User-Agent": UA_I, "Referer": "https://weibo.com/",
                         }), timeout=60)
                         with open(os.path.join(base, f"{title}_{idx}.jpg"), "wb") as f:
                             f.write(r.read())
                         saved_n += 1
                     except Exception:
                         pass
-            # live 图配对
             if live_url:
                 try:
                     rr = _OPENER.open(urllib.request.Request(live_url, headers={
-                        "User-Agent": UA_I,
-                        "Referer": "https://weibo.com/",
+                        "User-Agent": UA_I, "Referer": "https://weibo.com/",
                     }), timeout=60)
-                    with open(os.path.join(base, f"{title}_live{idx}.mov"), "wb") as f:
+                    tmp_mov = os.path.join(base, f"{title}_{idx}_live.mov")
+                    with open(tmp_mov, "wb") as f:
                         f.write(rr.read())
+                    img_path = os.path.join(base, f"{title}_{idx}.jpg")
+                    if os.path.isfile(img_path):
+                        from utils import make_live_photo
+                        make_live_photo(img_path, tmp_mov)
                 except Exception:
-                    pass  # live 图失败不阻塞图文入库
+                    pass
 
     if not saved_video and saved_n == 0:
         raise RuntimeError("微博媒体下载全部失败(原图+压缩图都拿不到)")
 
-    # 清理 lite.parser 残留的同内容孤儿目录(轻解析会 auto_save,带 #话题标签 尾)
-    # - 条件: 同日期目录下 + lite.parser 用户 + 标题是我们 clean_title 后的标题
-    #   (lite.parser 不清理 # 标签,所以带 # 尾的就是它的产物)
-    # - 仅当不在 DB 引用列表里才删(防误删已收藏内容)
+    rel = os.path.join("微博", today(), title)
+
+    # 清理 lite.parser 残留孤儿目录（必须在 rel 赋值之后）
     try:
         import pwd as _pwd
         date_dir = os.path.dirname(rel)
         full_date = os.path.join(MEDIA, date_dir)
         if os.path.isdir(full_date):
-            conn = sqlite3.connect(os.path.join(VALT, "media_library.db"))
-            refs = {r[0] for r in conn.execute("SELECT local_path FROM items WHERE local_path LIKE ?", (date_dir + "/%",))}
-            conn.close()
+            from db import get_paths_in_dir
+            refs = get_paths_in_dir(date_dir)
             for sibling in os.listdir(full_date):
                 if sibling == title or sibling == os.path.basename(rel):
                     continue
                 full = os.path.join(full_date, sibling)
                 if not os.path.isdir(full):
                     continue
-                # 必须是 lite.parser 用户(worker 是当前用户)+ 带 # 标签(轻解析的特征)
                 try:
                     own = _pwd.getpwuid(os.stat(full).st_uid).pw_name
                 except Exception:
                     continue
-                if own != "lite.parser":
+                if own != "lite.parser" or "#" not in sibling:
                     continue
-                if "#" not in sibling:
-                    continue
-                # 兄弟目录的 rel
                 sib_rel = os.path.join(date_dir, sibling)
                 if sib_rel in refs:
-                    continue  # DB 已引用,不删
+                    continue
                 try:
                     shutil.rmtree(full)
                 except Exception:
@@ -587,19 +551,15 @@ def download_weibo(url):
     except Exception:
         pass
 
-    rel = os.path.join("微博", today(), title)
     gen_thumb(base, title, is_video=saved_video)
     return rel, title, "微博", author
 
 
-# ── X / Twitter (2026-09-09) ──────────────────────────────
+# ── X / Twitter ──────────────────────────────────────────────
 def download_x(url):
-    """X/Twitter 链接: fxtwitter API 解析 → 桌面 UA + 代理下载 → 归档 → ingest
-    走 飞牛 trick: 不依赖 yt-dlp(反爬+amplify_video 不认),用 fxtwitter 拿 metadata + 最高码率视频流。
-    """
-    import re as _re
-    url = _re.sub(r'/video/\d+', '', url)  # 去掉 /video/1 后缀
-    m = _re.search(r'/([^/]+)/status/(\d+)', url)
+    """X/Twitter 链接下载"""
+    url = re.sub(r'/video/\d+', '', url)
+    m = re.search(r'/([^/]+)/status/(\d+)', url)
     if not m:
         raise RuntimeError("X 链接格式错(需 /<user>/status/<id>)")
     user, tid = m.group(1), m.group(2)
@@ -613,13 +573,11 @@ def download_x(url):
     if not media_all:
         raise RuntimeError("X 推文无媒体")
 
-    # 标题优先级
     if text:
         title = clean_title(text[:60]) or f"{author}_{tid[-8:]}"
     else:
         title = f"{author}_{tid[-8:]}"
 
-    # 选最高码率视频 or 第一张图
     videos = [m_ for m_ in media_all if m_.get("type") in ("video", "gif")]
     if videos:
         variants = videos[0].get("variants") or []
@@ -642,17 +600,13 @@ def download_x(url):
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"{title}_1.{ext}")
 
-    # 下载（必须走代理 + 桌面 UA，否则 video.twimg.com 国内被墙）
-    UA_D = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    proxy_handler = urllib.request.ProxyHandler({"http": "http://127.0.0.1:20172",
-                                                  "https": "http://127.0.0.1:20172"})
+    proxy_handler = urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
     opener = urllib.request.build_opener(proxy_handler)
     opener.addheaders = [("User-Agent", UA_D)]
     try:
         with opener.open(vurl, timeout=120) as r:
             data = r.read()
     except Exception:
-        # 直连兜底
         with urllib.request.urlopen(urllib.request.Request(vurl, headers={"User-Agent": UA_D}), timeout=120) as r:
             data = r.read()
     with open(path, "wb") as f:
@@ -662,9 +616,293 @@ def download_x(url):
     return os.path.join("X", today(), title), title, "X", author
 
 
+# ── TikTok (tikwm API) ──────────────────────────────────────
+def download_tiktok(url):
+    """TikTok 链接: tikwm API 解析 → 无水印视频/图片下载 → 归档。
+    tikwm 返回 data.play(无水印mp4) / data.wmplay(带水印) / data.images(图文)。
+    海外 CDN 需走代理。"""
+    # 提取视频 ID（用于缓存和校验）
+    m = re.search(r"/video/(\d+)", url) or re.search(r"/@[\w.]+/video/(\d+)", url)
+    if not m:
+        # 短链 t.tiktok.com 需展开
+        if "t.tiktok.com" in url or "vm.tiktok.com" in url:
+            try:
+                real = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15).geturl()
+                m = re.search(r"/video/(\d+)", real)
+                if m:
+                    url = real
+            except Exception:
+                pass
+    api = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url, safe='')}"
+    resp = fetch(api, timeout=30)
+    d = json.loads(resp.decode("utf-8", "ignore"))
+    if d.get("code") != 0:
+        raise RuntimeError(f"tikwm 解析失败: {d.get('msg', '?')}")
+    data = d.get("data") or {}
+    author_obj = data.get("author") or {}
+    author = author_obj.get("nickname") or author_obj.get("unique_id") or "TikTok用户"
+    avatar = author_obj.get("avatar") or ""
+    text = (data.get("title") or "").strip()
+    title = clean_title(text[:60]) or f"TikTok_{author[:20]}"
+
+    # 媒体选择：图文(images)优先，否则视频(play)
+    images = data.get("images") or []
+    play_url = data.get("play") or data.get("wmplay") or ""
+
+    d = os.path.join(MEDIA, "TikTok", today(), title)
+    os.makedirs(d, exist_ok=True)
+
+    saved = 0
+    if images:
+        # 图文：逐张下载
+        for i, img_url in enumerate(images, 1):
+            try:
+                data_bytes = fetch(img_url, timeout=60, use_proxy=True)
+                ext = "jpg"
+                if ".png" in img_url:
+                    ext = "png"
+                elif ".webp" in img_url:
+                    ext = "webp"
+                with open(os.path.join(d, f"{title}_{i}.{ext}"), "wb") as f:
+                    f.write(data_bytes)
+                saved += 1
+            except Exception as e:
+                log.warning(f"TikTok 图 {i} 下载失败: {e}")
+        is_video = False
+    elif play_url:
+        # 视频：下无水印 mp4
+        try:
+            data_bytes = fetch(play_url, timeout=120, use_proxy=True)
+            with open(os.path.join(d, f"{title}.mp4"), "wb") as f:
+                f.write(data_bytes)
+            saved = 1
+        except Exception as e:
+            # 无水印失败，试带水印
+            wm = data.get("wmplay") or ""
+            if wm:
+                try:
+                    data_bytes = fetch(wm, timeout=120, use_proxy=True)
+                    with open(os.path.join(d, f"{title}.mp4"), "wb") as f:
+                        f.write(data_bytes)
+                    saved = 1
+                    global SRC_TAG
+                    SRC_TAG = "wm"
+                    WARN.append("TikTok 无水印下载失败，已用带水印版")
+                except Exception:
+                    pass
+            if saved == 0:
+                raise RuntimeError(f"TikTok 视频下载失败: {e}")
+        is_video = True
+    else:
+        raise RuntimeError("TikTok 无媒体(图/视频都没有)")
+
+    gen_thumb(d, title, is_video=is_video)
+    return os.path.join("TikTok", today(), title), title, "TikTok", author
+
+
+# ════════════════════════════════════════════════════════════
+# 主页批量解析（profile → 单条 URL 列表）
+# ════════════════════════════════════════════════════════════
+
+PROFILE_MAX = 20  # 主页最多展开条数
+
+
+def parse_tiktok_profile(url: str) -> List[str]:
+    """TikTok 主页 → 最新 N 条视频 URL。
+    tikwm API: /api/user/posts?username=xxx&count=20"""
+    m = re.search(r"tiktok\.com/@([\w.]+)", url)
+    if not m:
+        raise RuntimeError("TikTok 主页格式错（需 /@username）")
+    username = m.group(1)
+    api = f"https://www.tikwm.com/api/user/posts?username={urllib.parse.quote(username)}&count={PROFILE_MAX}"
+    resp = fetch(api, timeout=30)
+    d = json.loads(resp.decode("utf-8", "ignore"))
+    if d.get("code") != 0:
+        raise RuntimeError(f"tikwm 主页解析失败: {d.get('msg', '?')}")
+    videos = (d.get("data") or {}).get("videos") or []
+    urls = []
+    for v in videos:
+        vid = v.get("video_id") or v.get("id")
+        if vid:
+            urls.append(f"https://www.tiktok.com/@{username}/video/{vid}")
+    return urls[:PROFILE_MAX]
+
+
+def parse_weibo_profile(url: str) -> List[str]:
+    """微博主页 → 最新 N 条微博 URL。
+    m.weibo.cn API: container/getIndex?type=uid&value=<uid>&containerid=107603<uid>"""
+    # 提取 UID
+    m = re.search(r"weibo\.com/u/(\d+)", url) or re.search(r"m\.weibo\.cn/profile/(\d+)", url)
+    if not m:
+        # 用户名形式 → 需要展开拿 uid
+        try:
+            real = _OPENER.open(urllib.request.Request(url, headers={"User-Agent": UA_I}), timeout=15).geturl()
+            m = re.search(r"weibo\.com/u/(\d+)", real) or re.search(r"m\.weibo\.cn/profile/(\d+)", real)
+        except Exception:
+            pass
+    if not m:
+        raise RuntimeError("微博主页无法提取 UID")
+    uid = m.group(1)
+    # 主页时间线
+    api = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}"
+    headers = {"User-Agent": UA_I, "Referer": f"https://m.weibo.cn/profile/{uid}",
+               "X-Requested-With": "XMLHttpRequest"}
+    req = urllib.request.Request(api, headers=headers)
+    resp = _OPENER.open(req, timeout=20).read().decode("utf-8", "ignore")
+    d = json.loads(resp)
+    cards = d.get("data", {}).get("cards", [])
+    urls = []
+    for card in cards:
+        mblog = card.get("mblog")
+        if not mblog:
+            continue
+        bid = mblog.get("bid")
+        if bid:
+            urls.append(f"https://m.weibo.cn/detail/{bid}")
+    return urls[:PROFILE_MAX]
+
+
+def parse_xhs_profile(url: str) -> List[str]:
+    """小红书主页 → 最新 N 条笔记 URL。
+    需要 cookie。解析主页 HTML 拿 noteId 列表，再拼成单条 URL。"""
+    # 提取用户 ID
+    m = re.search(r"user/profile/([a-f0-9]+)", url)
+    if not m:
+        raise RuntimeError("小红书主页格式错（需 /user/profile/<id>）")
+    user_id = m.group(1)
+    cookie = ""
+    if XHS_COOKIE_FILE and os.path.isfile(XHS_COOKIE_FILE):
+        cookie = open(XHS_COOKIE_FILE, encoding="utf-8").read().strip()
+    if not cookie:
+        raise RuntimeError("小红书主页解析需要 cookie（XHS_COOKIE_FILE 未配置）")
+    # 抓主页 HTML
+    page_url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+    headers = {"User-Agent": UA_D, "Referer": "https://www.xiaohongshu.com/", "Cookie": cookie}
+    req = urllib.request.Request(page_url, headers=headers)
+    html = _OPENER.open(req, timeout=25).read().decode("utf-8", "ignore")
+    # 从 HTML 里挖 noteId（页面 JSON 嵌在 window.__INITIAL_STATE__ 里）
+    note_ids = re.findall(r'"noteId":"([a-f0-9]+)"', html)
+    # 去重保序
+    seen, uniq = set(), []
+    for nid in note_ids:
+        if nid not in seen:
+            seen.add(nid)
+            uniq.append(nid)
+    urls = [f"https://www.xiaohongshu.com/discovery/item/{nid}" for nid in uniq]
+    return urls[:PROFILE_MAX]
+
+
+def parse_douyin_profile(url: str) -> List[str]:
+    """抖音主页 → 最新 N 条视频 URL。
+    抖音 web 端需 _signature，反爬最严。优先走轻解析服务（如果支持）。
+    目前为实验性实现，可能失败。"""
+    sec_uid = ""
+    m = re.search(r"douyin\.com/user/([^/?]+)", url)
+    if m:
+        sec_uid = m.group(1)
+    if not sec_uid:
+        raise RuntimeError("抖音主页无法提取 sec_uid")
+    # 尝试轻解析服务的主页接口（如果轻解析服务支持）
+    api = f"{LITE_PARSER_URL}/user/videos?sec_uid={urllib.parse.quote(sec_uid)}&count={PROFILE_MAX}"
+    try:
+        resp = fetch(api, timeout=40)
+        d = json.loads(resp.decode("utf-8", "ignore"))
+        if d.get("code") == 200:
+            videos = d.get("data", {}).get("videos") or []
+            urls = []
+            for v in videos:
+                vid = v.get("video_id") or v.get("aweme_id")
+                if vid:
+                    urls.append(f"https://www.douyin.com/video/{vid}")
+            if urls:
+                return urls[:PROFILE_MAX]
+    except Exception:
+        pass
+    raise RuntimeError("抖音主页解析失败（轻解析服务可能不支持主页接口，或需 _signature）")
+
+
+def parse_x_profile(url: str) -> List[str]:
+    """X/Twitter 主页 → 最新 N 条推文 URL。
+    fxtwitter 不支持主页。用 nitter 实例或 RSS 兜底。"""
+    m = re.search(r"x\.com/([\w]+)/?$", url) or re.search(r"twitter\.com/([\w]+)/?$", url)
+    if not m:
+        raise RuntimeError("X 主页格式错（需 /username）")
+    username = m.group(1)
+    # 尝试 fxtwitter 的用户 timeline（实验性）
+    api = f"https://api.fxtwitter.com/{username}"
+    try:
+        resp = _OPENER.open(urllib.request.Request(api, headers={"User-Agent": UA_D}), timeout=20)
+        d = json.loads(resp.read().decode("utf-8", "ignore"))
+        # fxtwitter 用户 API 返回最近推文（如果有）
+        tweets = d.get("tweets") or []
+        urls = [f"https://x.com/{username}/status/{t.get('id')}" for t in tweets if t.get("id")]
+        if urls:
+            return urls[:PROFILE_MAX]
+    except Exception:
+        pass
+    raise RuntimeError("X 主页解析失败（fxtwitter 不支持用户 timeline，建议用单条链接）")
+
+
+# 主页解析分发
+PROFILE_PARSERS = {
+    "tiktok": parse_tiktok_profile,
+    "weibo": parse_weibo_profile,
+    "xiaohongshu": parse_xhs_profile,
+    "douyin": parse_douyin_profile,
+    "x": parse_x_profile,
+}
+
+
+def detect_profile_platform(url: str) -> str:
+    """判断主页 URL 属于哪个平台"""
+    if "tiktok.com/@" in url:
+        return "tiktok"
+    if "weibo.com" in url or "m.weibo.cn/profile" in url:
+        return "weibo"
+    if "xiaohongshu.com/user/profile" in url or "xhslink.com/user" in url:
+        return "xiaohongshu"
+    if "douyin.com/user/" in url:
+        return "douyin"
+    if "x.com/" in url or "twitter.com/" in url:
+        return "x"
+    return ""
+
+
+def process_profile(item):
+    """处理主页任务：解析主页 → 拿单条 URL 列表 → 去重 → 加入队列"""
+    url = item["url"].strip()
+    platform = detect_profile_platform(url)
+    if not platform:
+        item["status"] = "failed"
+        item["message"] = "无法识别主页平台"
+        return
+    parser = PROFILE_PARSERS.get(platform)
+    if not parser:
+        item["status"] = "failed"
+        item["message"] = f"不支持 {platform} 主页解析"
+        return
+    try:
+        from queue_manager import add_sub_tasks
+        from db import get_item_by_url
+        urls = parser(url)
+        # 去掉 DB 里已收藏的
+        filtered = []
+        for u in urls:
+            if not get_item_by_url(u):
+                filtered.append(u)
+        added = add_sub_tasks(item["id"], filtered, platform)
+        item["status"] = "done"
+        item["title"] = f"主页展开 {platform}"
+        item["message"] = f"解析 {len(urls)} 条，去重后 {len(filtered)} 条已加入队列，新增 {added} 条"
+        log.info(f"主页展开 [{platform}] {url}: {len(urls)} 条 → 加入 {added} 条")
+    except Exception as e:
+        item["status"] = "failed"
+        item["message"] = f"主页解析失败: {str(e)[:120]}"
+        log.error(f"主页解析失败 [{platform}] {url}: {e}")
+
+
 def ingest(rel, title, url, platform, author=None, avatar=None):
-    # ⚠ 参数一律用 --opt=value 形式：作者名可能以「-」开头(如 -哇咔咔咔咔)，
-    #   用空格分隔时 argparse 会把它当选项 → "expected one argument" → 入库静默失败
+    """调用 ingest.py 入库"""
     args = [PY, INGEST, f"--platform={platform}", f"--url={url}", f"--path={rel}", f"--title={title}"]
     if author and author != "未知作者":
         args.append(f"--author={author}")
@@ -673,19 +911,14 @@ def ingest(rel, title, url, platform, author=None, avatar=None):
     r = subprocess.run(args, capture_output=True, timeout=60)
     out = (r.stdout or b"").decode("utf-8", "ignore")
     err = (r.stderr or b"").decode("utf-8", "ignore")
-    # 去重拦截或被跳过：下载的文件不会入库 → 清掉已下载目录防残留
-    # ⚠ 安全阀：若该目录已被库里某条目引用（轻解析会复用同名目录覆盖下载），绝不能删，
-    #   否则会把已收藏条目的媒体一起删掉（出现「有记录无文件」）
     if "已收藏过" in out or "跳过" in out:
         d = os.path.join(MEDIA, rel)
         referenced = False
         try:
-            import sqlite3 as _sq
-            _c = _sq.connect(os.path.join(VALT, "media_library.db"))
-            referenced = bool(_c.execute("SELECT 1 FROM items WHERE local_path=?", (rel,)).fetchone())
-            _c.close()
+            from db import is_path_referenced
+            referenced = is_path_referenced(rel)
         except Exception:
-            referenced = True  # 查不到就保守当作已引用，宁可不删
+            referenced = True
         if os.path.isdir(d) and not referenced:
             shutil.rmtree(d, ignore_errors=True)
         return False
@@ -694,14 +927,43 @@ def ingest(rel, title, url, platform, author=None, avatar=None):
     return True
 
 
+SCAN_EVERY = int(os.environ.get("WM_SCAN_EVERY", "20"))
+WM_SCAN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wm_scan.py")
+
+
+def bump_scan_counter():
+    """每成功入库 SCAN_EVERY 条，后台触发一次水印自检"""
+    try:
+        f = os.path.join(MEDIA, ".wm_counter")
+        n = int(open(f).read().strip() or 0) if os.path.isfile(f) else 0
+        n += 1
+        open(f, "w").write(str(n))
+        if n >= SCAN_EVERY:
+            open(f, "w").write("0")
+            py = sys.executable   # 宿主 python3（numpy/PIL 都在）
+            subprocess.Popen([py, WM_SCAN, "--limit", str(SCAN_EVERY)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            log.info(f"水印自检已触发（累计 {SCAN_EVERY} 条）")
+    except Exception as e:
+        log.warning(f"水印自检触发失败: {e}")
+
+
 def process_one(item):
+    global SRC_TAG
+    SRC_TAG = ""
     url = item["url"].strip()
     if not url.startswith("http"):
         item["status"] = "failed"
         item["message"] = "无效链接"
         return
+    # 主页任务走单独流程
+    if item.get("type") == "profile":
+        process_profile(item)
+        return
     try:
         author = None
+        avatar = None
         if "douyin" in url or "iesdouyin" in url:
             rel, title, plat, author = download_douyin(url)
         elif "xhslink" in url or "xiaohongshu" in url:
@@ -710,61 +972,68 @@ def process_one(item):
             rel, title, plat, author = download_x(url)
         elif "weibo.com" in url or "m.weibo.cn" in url or "t.cn" in url:
             rel, title, plat, author = download_weibo(url)
+        elif "tiktok.com" in url:
+            rel, title, plat, author = download_tiktok(url)
         else:
             item["status"] = "failed"
-            item["message"] = "不支持的平台(仅支持抖音/小红书/X/微博)"
+            item["message"] = "不支持的平台(支持抖音/小红书/X/微博/TikTok)"
             return
-        ingest(rel, title, item.get("original_url") or url, plat, author=author or None, avatar=avatar if plat == "小红书" else None)
+        ingest(rel, title, item.get("original_url") or url, plat,
+               author=author or None, avatar=avatar if plat == "小红书" else None,
+               src_tag=SRC_TAG)
+        bump_scan_counter()
         item["status"] = "done"
         item["title"] = title
         item["path"] = rel
+        # 重置重试计数（成功后清零）
+        item["retries"] = 0
         if WARN:
             item["message"] = "⚠️ " + "; ".join(WARN)
             WARN.clear()
         else:
             item["message"] = "完成"
     except Exception as e:
-        item["status"] = "failed"
-        item["message"] = str(e)[:150]
+        retries = item.get("retries", 0)
+        # 自动重试：最多 2 次，间隔递增（10s, 30s 由下次 cron 触发）
+        if retries < 2:
+            item["retries"] = retries + 1
+            item["status"] = "pending"  # 改回 pending，下次 drain 再试
+            item["message"] = f"自动重试中({item['retries']}/2): {str(e)[:80]}"
+            log.warning(f"自动重试 [{url}] ({item['retries']}/2): {e}")
+        else:
+            item["status"] = "failed"
+            item["message"] = str(e)[:150]
+            log.error(f"处理失败 [{url}] (已重试{retries}次): {e}")
+            # 失败 Bark 通知
+            _notify_failure(url, str(e)[:100])
+
+
+def _notify_failure(url: str, reason: str):
+    """失败超过重试次数后推送 Bark 通知"""
+    if not BARK_URL:
+        return
+    try:
+        import urllib.parse as up
+        title = "❌ 拾光集下载失败"
+        body = f"链接: {url[:60]}\n原因: {reason}"
+        u = f"{BARK_URL.rstrip('/')}/{up.quote(title)}/{up.quote(body)}"
+        _OPENER.open(urllib.request.Request(u), timeout=8).read()
+    except Exception:
+        pass
 
 
 def drain():
     q = load_queue()
     if not q:
         return
-    # 清理：done(成功已入库)清掉；failed 保留1天(超时自动清)；pending/processing保留
-    now_ts = time.time()
-    kept = []
-    for it in q:
-        st = it.get("status")
-        if st == "done":
-            if str(it.get("message", "")).startswith("⚠️"):
-                # 成功但带警告(如水印兜底)：保留 1 天让用户在队列页看到
-                try:
-                    ct = datetime.strptime(it.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
-                    if now_ts - ct.timestamp() > 86400:
-                        continue
-                except Exception:
-                    pass
-                kept.append(it)
-                continue
-            continue  # 成功直接删
-        if st == "failed":
-            # 超过1天自动清（86400s），保留原因供短期查看
-            try:
-                ct = datetime.strptime(it.get("created_at", ""), "%Y-%m-%d %H:%M:%S")
-                if now_ts - ct.timestamp() > 86400:
-                    continue
-            except Exception:
-                pass  # created_at 无法解析则保留
-        kept.append(it)
-    if len(kept) != len(q):
-        q = kept
-        save_queue(q)
+    # 清理过期条目
+    from queue_manager import cleanup_queue
+    cleanup_queue()
+    q = load_queue()
     if not q:
         return
+
     changed = False
-    # 只把第一个 pending 标记为 processing(其余保持 pending, 下次周期再处理)
     for item in q:
         if item.get("status") == "pending":
             item["status"] = "processing"
@@ -772,25 +1041,22 @@ def drain():
             break
     if changed:
         save_queue(q)
-    # 处理第一个 processing, 立即保存
     for item in q:
         if item.get("status") == "processing":
             process_one(item)
-            # 成功的立即从队列移除(已入库)；失败的保留(原因让用户看)
+            # done 的立即移除；failed/pending(重试中) 保留
             if item.get("status") == "done":
                 q = [it for it in q if it.get("id") != item.get("id")]
             save_queue(q)
-            break  # 每次调用只处理一个，防超时; 下个周期处理下一个
+            break
 
 
 def main():
-    # cron no_agent 直接跑脚本(不带参数) → 默认执行 drain; --drain 仅是显式同效
-    # 简单锁防并发
     if os.path.isfile(LOCK):
         try:
             age = time.time() - os.path.getmtime(LOCK)
             if age < 90:
-                return  # 上次还在跑(超90s才允许重入)
+                return
         except Exception:
             pass
     open(LOCK, "w").close()
