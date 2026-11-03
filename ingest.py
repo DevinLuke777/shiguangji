@@ -14,8 +14,10 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from config import DB_PATH, MEDIA_ROOT, LITE_PARSER_URL, BARK_URL, UA_MOBILE
-from db import get_conn, insert_item, get_item_by_url, item_exists_by_path
-from utils import parse_xhs_meta, download_avatar_local
+from db import (get_conn, insert_item, get_item_by_url, get_item_by_fingerprint,
+                get_item_by_content_key, item_exists_by_path, is_path_referenced)
+from utils import (parse_xhs_meta, download_avatar_local, media_fingerprint,
+                   trash_duplicate, content_key_from_url)
 from logger import log
 
 
@@ -205,11 +207,60 @@ def ingest(platform: str, url: str, local_path: str,
     if not row["title"] and local_path:
         row["title"] = os.path.basename(local_path.rstrip("/"))[:100]
 
-    # 去重保护
+    # 内容指纹（兜底去重：短链/重新分享/标题不同都绕不过）
+    full_dir = os.path.join(MEDIA_ROOT, local_path) if local_path else ""
+    row["fingerprint"] = media_fingerprint(full_dir)
+    # 平台原生 ID（首选去重键：换短链、换 xsec_token 都命中）
+    row["content_key"] = content_key_from_url(url)
+
+    # 路径体检：必须 平台/日期/条目 三段，指向日期目录=下载没落到条目目录
+    # （空标题会让目录名变空直接落进日期目录 → 页面显示"有标题没视频"的假条目）
+    parts = [p for p in (local_path or "").replace("\\", "/").split("/") if p]
+    if len(parts) < 3:
+        log.error(f"❌ 路径非法（{local_path!r}，应形如 平台/日期/标题），拒绝入库")
+        print("BADPATH 入库路径不是条目目录")
+        return False
+    if not os.path.isdir(full_dir):
+        log.error(f"❌ 条目目录不存在（{local_path!r}），拒绝入库")
+        print("BADPATH 条目目录不存在")
+        return False
+
+    # ── 去重保护 ①：平台原生 ID 命中（最稳：换短链/换 xsec_token 也绕不过）──
+    def _handle_dup(dup_row, reason: str) -> None:
+        """命中重复：按需把新目录移进回收站（绝不 rm），打印 DUP 标记给 worker"""
+        same_dir = (dup_row.get("local_path") or "").rstrip("/") == (local_path or "").rstrip("/")
+        if full_dir and os.path.isdir(full_dir) and not same_dir:
+            try:
+                if not is_path_referenced(local_path):
+                    dst = trash_duplicate(full_dir, platform, tag=f"dup_of_{dup_row['id']}")
+                    if dst:
+                        log.info(f"   重复目录已移入回收站: {dst}")
+            except Exception as e:
+                log.warning(f"   重复目录移动失败: {e}")
+        print(f"DUP {reason} id={dup_row['id']}")
+
+    if row["content_key"] and not force:
+        ck_dup = get_item_by_content_key(row["content_key"])
+        if ck_dup:
+            log.info(f"♻️ 同一条内容已收藏过（content_key={row['content_key']} 命中 id={ck_dup['id']}"
+                     f"「{ck_dup.get('title') or '无标题'}」），不入库")
+            _handle_dup(ck_dup, "同一条内容")
+            return False
+
+    # ── 去重保护 ②：内容指纹命中 ──────────────────
+    if row["fingerprint"] and not force:
+        fp_dup = get_item_by_fingerprint(row["fingerprint"])
+        if fp_dup:
+            log.info(f"♻️ 内容重复（指纹 {row['fingerprint'][:18]}… 命中 id={fp_dup['id']}「{fp_dup.get('title') or '无标题'}」），不入库")
+            _handle_dup(fp_dup, "内容重复")
+            return False
+
+    # ── 去重保护 ③：同一原链接 ──────────────────
     if url and not force:
         dup = get_item_by_url(url)
         if dup:
             log.info(f"⚠️ 已收藏过 (id={dup['id']})「{dup.get('title') or '无标题'}」，跳过")
+            print(f"DUP 已收藏过 id={dup['id']}")
             return False
 
     ok = insert_item(row)
@@ -266,6 +317,8 @@ def scan_and_ingest() -> None:
                     "original_url": f"scan://{rel}",
                     "cover_path": detect_cover_path(rel),
                     "media_type": detect_media_type(rel),
+                    "fingerprint": media_fingerprint(idir),
+                    "content_key": "",
                 }
                 ok = insert_item(row)
                 if ok:

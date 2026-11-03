@@ -143,16 +143,48 @@ def get_item_by_url(url: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def get_item_by_fingerprint(fp: str) -> Optional[Dict[str, Any]]:
+    """按内容指纹查询（去重用，与 original_url 无关）"""
+    if not fp:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, title, original_url, local_path, content_key FROM items "
+            "WHERE fingerprint=? ORDER BY id LIMIT 1",
+            (fp,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_item_by_content_key(ck: str) -> Optional[Dict[str, Any]]:
+    """按平台原生 ID 查询（首选去重键：换短链/换 xsec_token 都命中）"""
+    if not ck:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, title, original_url, local_path, fingerprint FROM items "
+            "WHERE content_key=? ORDER BY id LIMIT 1",
+            (ck,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def insert_item(data: Dict[str, Any]) -> bool:
     """插入条目，返回是否成功"""
     try:
         with db_cursor() as cur:
             data.setdefault("src_tag", "")
             data.setdefault("wm_flag", "")
+            data.setdefault("fingerprint", "")
+            data.setdefault("content_key", "")
             cur.execute("""
                 INSERT OR REPLACE INTO items
-                (platform, title, content, author_name, author_avatar, post_date, original_url, local_path, cover_path, media_type, src_tag, wm_flag)
-                VALUES (:platform, :title, :content, :author_name, :author_avatar, :post_date, :original_url, :local_path, :cover_path, :media_type, :src_tag, :wm_flag)
+                (platform, title, content, author_name, author_avatar, post_date, original_url, local_path, cover_path, media_type, src_tag, wm_flag, fingerprint, content_key)
+                VALUES (:platform, :title, :content, :author_name, :author_avatar, :post_date, :original_url, :local_path, :cover_path, :media_type, :src_tag, :wm_flag, :fingerprint, :content_key)
             """, data)
         return True
     except Exception as e:
@@ -379,6 +411,24 @@ def migrate_db() -> None:
                         fixed_cover += 1
             _set_schema_version(cur, 5)
             log.info(f"迁移: v5 — 补封面 {fixed_cover} 条，纠正类型 {fixed_type} 条")
+
+        # v6: 内容指纹字段（去重只看 URL 会被不同短链绕过，改为看文件内容）
+        if current < 6:
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(items)").fetchall()}
+            if "fingerprint" not in cols:
+                cur.execute("ALTER TABLE items ADD COLUMN fingerprint TEXT DEFAULT ''")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON items(fingerprint)")
+            _set_schema_version(cur, 6)
+            log.info("迁移: v6 — 添加 fingerprint 字段（内容指纹去重）")
+
+        # v7: 平台原生内容 ID（换短链 / 换 xsec_token 都绕不过）
+        if current < 7:
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(items)").fetchall()}
+            if "content_key" not in cols:
+                cur.execute("ALTER TABLE items ADD COLUMN content_key TEXT DEFAULT ''")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_content_key ON items(content_key)")
+            _set_schema_version(cur, 7)
+            log.info("迁移: v7 — 添加 content_key 字段（平台原生 ID 去重）")
 
         conn.commit()
     finally:

@@ -18,7 +18,7 @@ import shutil
 import sys
 import tempfile
 
-REPO = os.environ.get("XHS_DIR") or os.path.expanduser("~/.hermes/workspace/xhs-downloader")
+REPO = os.environ.get("XHS_DIR") or "/home/16675244747/.hermes/workspace/xhs-downloader"
 sys.path.insert(0, REPO)
 os.environ.pop("PYTHONPATH", None)
 

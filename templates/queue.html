@@ -5,6 +5,9 @@
   <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px">
     <h1 style="font-size:22px;font-weight:700;letter-spacing:-.02em">📥 入库队列</h1>
     <div style="display:flex;gap:8px">
+      {% if fail_count %}
+      <form method="post" action="/queue-retry" style="display:inline" onsubmit="return confirm('把 {{ fail_count }} 条失败的重新排队？')"><button class="vbtn" style="background:var(--accent);color:#fff;border-color:var(--accent)">🔄 重试全部({{ fail_count }})</button></form>
+      {% endif %}
       <form method="post" action="/queue-clear-failed" style="display:inline" onsubmit="return confirm('清除所有失败的条目？')"><button class="vbtn" style="background:var(--danger);color:#fff;border-color:var(--danger)">🗑️ 失败({{ fail_count }})</button></form>
       <form method="post" action="/queue-clear-all" style="display:inline" onsubmit="return confirm('清空整个队列？')"><button class="vbtn">✖️ 全部</button></form>
     </div>

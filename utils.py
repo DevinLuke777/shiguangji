@@ -5,12 +5,22 @@
 import os
 import re
 import time
+import hashlib
 import urllib.request
 import urllib.parse
 from collections import OrderedDict
 from typing import Optional, Tuple, List
 from config import UA_MOBILE, UA_DESKTOP, VIDEO_EXT, IMAGE_EXT, MEDIA_ROOT
 from logger import log
+
+# ── 内容指纹 / 回收目录（去重规则）──────────────────
+# v2（2026-11-01）：确定性算法 —— 目录内**所有**媒体文件，按文件名排序，逐个 update
+#   文件名 + 大小 + 前 1MB 内容，最后拼上文件总数。视频/图文/实况同一条路径。
+#   v1 的「挑最大视频只读前 8MB / 有视频就不看图片」在实况图（jpeg+同名 mp4 混放）上
+#   会挑错文件，同一内容算出不同指纹，去重完全失效 —— 不要再改回这种分支。
+FP_VER = "v2"
+FP_HEAD = 1024 * 1024             # 每文件只读前 1MB（全量哈希 4000 个目录太慢）
+TRASH_DUP = os.environ.get("TRASH_DUP_DIR", "/vol1/1000/Downloads/_trash_dup")
 
 # 全局 opener（不走代理，本机服务防劫持）
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -41,20 +51,37 @@ def fetch(url: str, timeout: int = 20, referer: Optional[str] = None,
 
 
 def clean_title(t: str) -> str:
-    """清洗标题：去首尾非法字符、换行、话题标签、截断"""
-    t = (t or "").strip()
+    """清洗标题：去首尾非法字符、换行、话题标签、截断
+
+    ⚠️ 纯 emoji 标题（🍸 / ⛵️ / _(:з」∠)_）不能洗成空串 —— 空串会让
+    目录名变空、落盘直接进「平台/日期/」目录，入库就成没有媒体的假条目
+    （2026-11-01 用户报「主页展开的条目没视频」根因之一）。洗空了就退回原文。
+    """
+    orig = (t or "").strip()
+    t = orig
     while t and not re.match(r"[一-鿿A-Za-z0-9]", t[0]):
         t = t[1:]
-    t = re.sub(r'[\n\r]+', ' ', t).strip()
+    if not t.strip():
+        t = orig                      # 整条都是 emoji/符号 -> 保留原文
+    t = re.sub(r'[\n\r\t]+', ' ', t).strip()
+    t = t.replace("/", "／").replace("\\", "＼")
     t = re.sub(r'(\s*#\S+\s*)+$', '', t).strip()
+    if not t.strip():
+        t = orig
     if len(t) > 80:
         t = t[:80].rstrip()
     return t
 
 
 def sanitize_filename(name: str, max_len: int = 60) -> str:
-    """过滤文件名非法字符"""
-    return "".join(c for c in name if c not in ':：/\\*?"<>|')[:max_len]
+    """过滤文件名非法字符
+
+    同时去掉前导点：目录/文件以 "." 开头会被当成隐藏文件，
+    页面（list_item_files 跳过 . 开头）就看不到 → 表现为「有标题没视频」。
+    """
+    s = "".join(c for c in name if c not in ':：/\\*?"<>|')
+    s = s.strip().lstrip(".").strip()
+    return s[:max_len]
 
 
 def is_video(filename: str) -> bool:
@@ -276,25 +303,30 @@ def make_live_photo(jpg_path: str, video_path: str) -> str:
 
     # JPG 侧：写 MakerApple65 (MediaGroupUUID) + Make=Apple
     try:
-        subprocess.run([
-            "exiftool", "-overwrite_original", "-q",
+        r = subprocess.run([
+            "exiftool", "-overwrite_original",
             f"-MakerApple65={pair_uuid}",
             "-Make=Apple",
             jpg_path
-        ], capture_output=True, timeout=10)
+        ], capture_output=True, timeout=10, text=True)
+        if "1 image files updated" not in (r.stdout or "") + (r.stderr or ""):
+            # 多数 exiftool 版本不允许凭空创建 MakerApple 块，图片侧元数据写不进是已知限制
+            log.info(f"JPG 侧 Apple 元数据未写入（exiftool 不支持创建 MakerApple 块）: {basename}")
     except Exception as e:
         log.warning(f"JPG Live Photo 元数据写入失败 {jpg_path}: {e}")
 
-    # MOV 侧：写 ContentIdentifier + StillImageTime
-    # StillImageTime 需要写入 metadata track，exiftool 用 -api 支持有限
-    # 实测：ContentIdentifier 足以让 iPhone 识别配对
+    # MOV 侧：写 ContentIdentifier（必须用 Keys: 前缀，否则 exiftool 会「unchanged」静默失败）
+    # StillImageTime 需要写 metadata track，exiftool 支持有限；ContentIdentifier 足以让 iPhone 识别配对
     try:
-        subprocess.run([
-            "exiftool", "-overwrite_original", "-q",
-            f"-ContentIdentifier={pair_uuid}",
+        r = subprocess.run([
+            "exiftool", "-overwrite_original",
+            f"-Keys:ContentIdentifier={pair_uuid}",
             video_path
-        ], capture_output=True, timeout=10)
-        log.info(f"Live Photo 元数据注入完成: {basename} (UUID={pair_uuid[:8]}...)")
+        ], capture_output=True, timeout=10, text=True)
+        if "1 image files updated" in (r.stdout or "") + (r.stderr or ""):
+            log.info(f"Live Photo 元数据注入完成: {basename} (UUID={pair_uuid[:8]}...)")
+        else:
+            log.warning(f"MOV ContentIdentifier 未写入: {(r.stderr or r.stdout or '').strip()[:120]}")
     except Exception as e:
         log.warning(f"MOV Live Photo 元数据写入失败 {video_path}: {e}")
 
@@ -333,6 +365,143 @@ class AvatarCache:
 
     def clear(self) -> None:
         self._store.clear()
+
+
+def _sha256_file(path: str, head: int = 0) -> str:
+    """算文件 sha256；head>0 时只读前 head 字节（视频用，省 IO）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        if head:
+            h.update(f.read(head))
+        else:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def media_fingerprint(full_dir: str) -> str:
+    """
+    目录内容指纹（去重用，不看 URL，只看实际文件内容）。
+
+    确定性算法（同一内容任何时候都算出同一个值）：
+      - 取目录里**所有**媒体文件（视频+图片），排除 `_thumb*` 与 `.`/`_` 开头的辅助文件
+      - **按文件名排序**（不按大小、不分类、不为「有视频」另开分支）
+      - 逐个 update(文件名 + 文件大小(8字节) + 前 FP_HEAD 字节内容)
+      - 最后拼上媒体文件总数
+    图文 / 实况图（jpeg + 同名 mp4 混放）/ 纯视频 / 纯图片 全部走同一条路径。
+
+    返回 "v2:<文件数>:<sha256>"；返回 "" 表示目录不存在 / 读不到 / 没有媒体文件
+    （此时放弃去重判断，宁可漏杀不误杀 —— 抖音目录常是 lite.parser 700 权限）。
+    """
+    if not full_dir or not os.path.isdir(full_dir):
+        return ""
+    try:
+        names = sorted(n for n in os.listdir(full_dir)
+                       if not n.startswith((".", "_")))
+    except (PermissionError, OSError):
+        return ""
+    media = [n for n in names if n.lower().endswith(VIDEO_EXT + IMAGE_EXT)]
+    if not media:
+        return ""
+    h = hashlib.sha256()
+    try:
+        for n in media:
+            p = os.path.join(full_dir, n)
+            if not os.path.isfile(p):
+                continue
+            size = os.path.getsize(p)
+            h.update(n.encode("utf-8", "ignore"))
+            h.update(b"\0")
+            h.update(size.to_bytes(8, "big"))
+            with open(p, "rb") as f:
+                h.update(f.read(FP_HEAD))
+    except (PermissionError, OSError):
+        return ""
+    return f"{FP_VER}:{len(media)}:{h.hexdigest()}"
+
+
+# ── 平台原生内容 ID（content_key，首选去重键）──────────────
+# 换短链 / 换 xsec_token / 重新分享都改不了它，比文件指纹更稳。
+_CK_RULES = (
+    ("xhs", re.compile(r"/(?:explore|discovery/item)/([0-9a-f]{24})", re.I)),
+    ("dy",  re.compile(r"douyin\.com/(?:video|note|share/video)/([A-Za-z0-9]{6,})", re.I)),
+    ("wb",  re.compile(r"weibo\.(?:com|cn)/(?:\d+|detail)/([A-Za-z0-9]{6,})", re.I)),
+    ("bl",  re.compile(r"bilibili\.com/video/(BV[A-Za-z0-9]{10}|av\d+)", re.I)),
+    ("tt",  re.compile(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)", re.I)),
+    ("x",   re.compile(r"(?:twitter|x)\.com/[^/]+/status/(\d+)", re.I)),
+)
+_SHORT_HOSTS = ("v.douyin.com", "xhslink.com", "xhslink.cn", "b23.tv", "t.cn", "vm.tiktok.com")
+
+
+def resolve_short_url(url: str, timeout: int = 8) -> str:
+    """短链跟重定向拿到真实 URL；失败原样返回（不阻塞入库）。"""
+    if not url or not any(h in url for h in _SHORT_HOSTS):
+        return url
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA_MOBILE})
+        with _OPENER.open(req, timeout=timeout) as r:
+            return r.geturl() or url
+    except urllib.error.HTTPError as e:
+        # 跳转后的落地页 404/403 很常见，重定向目标在 e.url 里，别当失败丢掉
+        return e.geturl() or url
+    except Exception as e:
+        log.warning(f"短链解析失败（用原链接算 content_key）: {e}")
+        return url
+
+
+def content_key_from_url(url: str, resolve: bool = True) -> str:
+    """
+    从链接提取平台原生 ID → "xhs:6ac1d414000000001500ee79" 这种形式。
+    短链（v.douyin.com / xhslink.com / b23.tv …）先跟重定向再取。
+    取不到返回 ""（此时只用文件指纹兜底）。
+    """
+    if not url or url.startswith("scan://"):
+        return ""
+    if url.startswith("//"):          # 协议相对链接（worker 抓到的分享链接常见）
+        url = "https:" + url
+    cands = [url]
+    r = resolve_short_url(url) if resolve else ""
+    if r and r != url:
+        cands += [r, urllib.parse.unquote(r)]  # 小红书短链常落到 /404/sec?originalUrl=<编码后的真链>
+    for u in cands:
+        if not u:
+            continue
+        for tag, rx in _CK_RULES:
+            m = rx.search(u)
+            if m:
+                return f"{tag}:{m.group(1).lower() if tag in ('xhs', 'bl') else m.group(1)}"
+    return ""
+
+
+def trash_duplicate(full_dir: str, platform: str = "", tag: str = "") -> str:
+    """把重复/失败的媒体目录移到回收目录（绝不 rm）。返回新路径，失败返回 ""。"""
+    if not os.path.isdir(full_dir):
+        return ""
+    dst_root = os.path.join(TRASH_DUP, platform or "未知")
+    try:
+        os.makedirs(dst_root, exist_ok=True)
+    except OSError:
+        return ""
+    base = os.path.basename(full_dir.rstrip("/")) or f"item_{int(time.time())}"
+    if tag:
+        base = f"{base}__{tag}"
+    dst = os.path.join(dst_root, base)
+    n = 2
+    while os.path.exists(dst):
+        dst = os.path.join(dst_root, f"{base}_{n}")
+        n += 1
+    try:
+        os.rename(full_dir, dst)
+    except OSError:
+        try:
+            import shutil
+            shutil.move(full_dir, dst)
+        except Exception:
+            return ""
+    return dst
 
 
 def download_avatar_local(avatar_url: str, dest_path: str) -> bool:

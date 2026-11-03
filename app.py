@@ -360,6 +360,14 @@ def queue_retry():
     qid = request.form.get("id", type=int)
     if qid is not None:
         retry_queue_item(qid)
+    else:
+        # 不带 id = 一键重试全部失败条目
+        for it in load_queue():
+            if it.get("status") == "failed":
+                try:
+                    retry_queue_item(it["id"])
+                except Exception:
+                    pass
     return redirect(url_for("queue_status"))
 
 
